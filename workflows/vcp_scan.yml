@@ -1,0 +1,83 @@
+name: VCP Scanner – Daily US Stock Alert
+
+on:
+  schedule:
+    # Run Monday–Friday at 22:00 UTC (= 06:00 Taiwan time next day)
+    # Adjust cron time to your preferred timezone
+    - cron: "0 22 * * 1-5"
+
+  workflow_dispatch:   # Allow manual trigger from GitHub UI
+    inputs:
+      min_score:
+        description: "Minimum VCP Score (0-100)"
+        required: false
+        default: "65"
+      min_grade:
+        description: "Minimum Grade (A+, A, B, C, D)"
+        required: false
+        default: "B"
+
+jobs:
+  vcp-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120   # Full scan may take 60-90 min
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ─────────────────────────
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 4. Run VCP Scanner ──────────────────────────────
+      - name: Run VCP Scanner
+        env:
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+          EMAIL_SENDER:    ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD:  ${{ secrets.EMAIL_PASSWORD }}
+          MIN_SCORE:       ${{ github.event.inputs.min_score || '65' }}
+          MIN_GRADE:       ${{ github.event.inputs.min_grade || 'B' }}
+        run: |
+          python vcp_scanner.py
+
+      # ── 5. Upload results as artifact ───────────────────
+      - name: Upload VCP Results JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcp-results-${{ github.run_number }}
+          path: |
+            vcp_results.json
+            vcp_scan.log
+          retention-days: 30
+
+      # ── 6. Commit results to repo (optional) ────────────
+      - name: Commit Results to Repository
+        if: success()
+        run: |
+          git config --global user.name  "VCP Bot"
+          git config --global user.email "vcp-bot@github.com"
+          
+          # Create results directory if it doesn't exist
+          mkdir -p results
+          
+          # Copy results with date stamp
+          DATE=$(date +%Y-%m-%d)
+          cp vcp_results.json "results/vcp_${DATE}.json" 2>/dev/null || true
+          
+          git add results/ || true
+          git diff --staged --quiet || git commit -m "📈 VCP Scan Results – ${DATE} [skip ci]"
+          git push || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
