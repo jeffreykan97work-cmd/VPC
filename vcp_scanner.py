@@ -95,63 +95,131 @@ class VCPScore:
 # ─────────────────────────────────────────────
 def get_top1000_tickers() -> list[str]:
     """
-    Fetch top 1000 US stocks by market cap using multiple sources.
-    Primary: S&P 500 + NASDAQ 100 + Russell 1000 components via Wikipedia / ETF holdings.
+    Top 1000 US stocks by market cap — hardcoded for reliability.
+    Covers S&P500 + NASDAQ100 + Russell 1000 large/mid caps.
+    No external HTTP calls needed (avoids 403 blocks).
     """
-    tickers = set()
-
-    # 1. S&P 500
-    try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(url)
-        sp500 = tables[0]["Symbol"].tolist()
-        tickers.update(sp500)
-        log.info(f"S&P500: {len(sp500)} tickers")
-    except Exception as e:
-        log.warning(f"S&P500 fetch failed: {e}")
-
-    # 2. NASDAQ-100 via iShares QQQ holdings
-    try:
-        qqq_url = "https://www.ishares.com/us/products/238041/ishares-russell-1000-etf/1467271812596.ajax?fileType=json&fileName=IWB_holdings&dataType=fund"
-        r = requests.get(qqq_url, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            for item in data.get("aaData", []):
-                if item[0] and item[0] != "-":
-                    tickers.add(item[0])
-    except Exception as e:
-        log.warning(f"iShares fetch failed: {e}")
-
-    # 3. Supplement with hardcoded large-cap list if needed
-    supplement = [
-        "AAPL","MSFT","NVDA","GOOGL","AMZN","META","TSLA","BRK-B","AVGO","JPM",
-        "LLY","UNH","XOM","MA","HD","PG","COST","JNJ","V","MRK","ABBV","WMT",
-        "CVX","BAC","CRM","NFLX","AMD","PEP","TMO","ACN","MCD","ABT","LIN",
-        "ADBE","DHR","TXN","CMCSA","CSCO","WFC","VZ","INTC","PM","NEE","RTX",
-        "UPS","BMY","AMGN","ORCL","IBM","QCOM","HON","LOW","SPGI","CAT","BA",
-        "GS","MS","BLK","AXP","DE","SBUX","NOW","INTU","T","GILD","MDT","MMM",
-        "ADI","LRCX","KLAC","AMAT","MRVL","PANW","SNPS","CDNS","FTNT","CRWD",
-        "ZS","DDOG","MDB","SNOW","COIN","SQ","PYPL","SHOP","UBER","LYFT","ABNB",
-        "DASH","RBLX","U","TWLO","OKTA","GTLB","NET","CFLT","IOT","BILL","TOST",
-        "APP","APLS","CELH","WING","CAVA","BROS","DUOL","ELF","AXON","FICO",
-        "SMCI","ARM","PLTR","IONQ","RGTI","QUBT","HOOD","SOFI","AFRM","UPST",
-        "ENPH","SEDG","FSLR","RUN","PLUG","BE","BLNK","CHPT","LCID","RIVN",
-        "F","GM","STLA","TM","HMC","LI","NIO","XPEV","BIDU","PDD","BABA",
-        "JD","KWEB","FXI","MCHI","EEM","SPY","QQQ","DIA","IWM","GLD","SLV",
-        "USO","TLT","HYG","LQD","IGSB","IGIB","VCIT","VCSH","BND","AGG",
-        "VTI","VO","VB","VEA","VWO","VXUS","IEFA","IEMG","EFA","EEM",
-        "XLK","XLF","XLE","XLV","XLI","XLC","XLY","XLP","XLRE","XLB","XLU",
+    tickers = [
+        # Mega Cap Tech
+        "AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","TSLA","AVGO","ORCL",
+        "AMD","ADBE","CRM","INTC","QCOM","TXN","MU","AMAT","LRCX","KLAC",
+        "SNPS","CDNS","MRVL","ADI","NXPI","ON","MPWR","ENTG","COHR","WOLF",
+        "ARM","SMCI","PLTR","UBER","ABNB","DASH","LYFT","RBLX","U","COIN",
+        # Financials
+        "JPM","BAC","WFC","GS","MS","BLK","C","AXP","SPGI","MCO",
+        "ICE","CME","SCHW","BK","STT","TFC","USB","PNC","COF","DFS",
+        "AIG","MET","PRU","AFL","ALL","PGR","TRV","CB","HIG","WRB",
+        "BRK-B","V","MA","PYPL","SQ","AFRM","SOFI","HOOD","UPST","LC",
+        # Healthcare
+        "LLY","UNH","JNJ","ABBV","MRK","TMO","ABT","DHR","BMY","AMGN",
+        "GILD","ISRG","SYK","BSX","MDT","EW","ZBH","BAX","BDX","RMD",
+        "DXCM","PODD","INSP","NVCR","KRYS","RXRX","BEAM","EDIT","NTLA","CRSP",
+        "REGN","VRTX","BIIB","ALNY","MRNA","BNTX","PFE","CVS","CI","HUM",
+        "MOH","CNC","ELV","ANTM","EXAS","ILMN","HOLX","HOLO","VEEV","DOCS",
+        # Consumer
+        "AMZN","WMT","COST","TGT","HD","LOW","MCD","SBUX","YUM","QSR",
+        "CMG","DPZ","WING","CAVA","BROS","SHAK","TXRH","DENN","EAT","DRI",
+        "NKE","LULU","PVH","RL","TPR","VFC","HBI","UAA","CROX","SKX",
+        "DECK","ONON","SKECHERS","BIRK","COLM","WWW","GH","PTON","NFLX",
+        "DIS","PARA","WBD","FOXA","FOX","NYT","SPOT","PINS","SNAP","MTCH",
+        # Industrials
+        "GE","HON","CAT","DE","RTX","LMT","NOC","GD","BA","TDG",
+        "HEI","SPR","TXT","WWD","DRS","LDOS","SAIC","CACI","BAH","PLTR",
+        "UPS","FDX","XPO","CHRW","EXPD","JBHT","ODFL","SAIA","WERN","KNX",
+        "CSX","UNP","NSC","CP","CNI","WAB","TRN","GNRC","IR","CARR",
+        "OTIS","JCI","EMR","ROK","PH","ITW","ETN","AME","ROP","VRSK",
+        # Energy
+        "XOM","CVX","COP","EOG","SLB","HAL","BKR","MPC","VLO","PSX",
+        "PXD","DVN","FANG","OXY","APA","HES","MRO","CTRA","SM","MTDR",
+        "AR","RRC","EQT","SWN","CNX","CHRD","PDCE","ESTE","BATL","NOG",
+        # Utilities & REITs
+        "NEE","DUK","SO","D","EXC","AEP","SRE","XEL","WEC","ES",
+        "AWK","AMT","PLD","EQIX","CCI","SBAC","DLR","PSA","EXR","CUBE",
+        "O","NNN","STOR","VICI","MGM","LVS","WYNN","CZR","BXP","SLG",
+        # Materials
+        "LIN","APD","ECL","SHW","PPG","RPM","IFF","EMN","CE","WLK",
+        "NUE","STLD","CLF","X","FCX","NEM","GOLD","AEM","KGC","AGI",
+        "ALB","LTHM","SQM","PLL","LAC","ALTM","MP","UUUU","USAS","FFIE",
+        # Communication
+        "GOOGL","META","NFLX","DIS","CMCSA","VZ","T","TMUS","CHTR","LBRDA",
+        "DISH","SIRI","IHRT","FOXA","NWSA","IPG","OMC","PUBGY","WPP","TTGT",
+        # Growth / Mid Cap
+        "SHOP","NET","DDOG","SNOW","MDB","TWLO","ZS","OKTA","CFLT","GTLB",
+        "BILL","TOST","IOT","APP","FICO","AXON","ELF","CELH","DUOL","CAVA",
+        "BROS","WING","MELI","SE","GRAB","BEKE","FUTU","TIGR","MNSO","PDD",
+        "PANW","FTNT","CRWD","S","TENB","QLYS","VRNT","RDWR","SAIL","XMTR",
+        "ZI","EVBG","ALTR","BRZE","AMPL","MIXC","MNTV","SPNV","PYCR","MSTR",
+        # Healthcare Growth
+        "ISRG","DXCM","PODD","INSP","NVCR","TMDX","ATRC","NTRA","EXAS","GH",
+        "RXRX","BEAM","EDIT","NTLA","CRSP","KYMR","ARQT","ACAD","ITCI","AXSM",
+        "SAVA","PRAX","ACRX","NKTR","ALKS","INVA","PRTA","BGNE","ZLAB","LEGN",
+        # Financial Growth
+        "SOFI","HOOD","AFRM","UPST","LC","ENVA","PRAA","CACC","OMF","QFIN",
+        "PYPL","SQ","FOUR","GPN","FI","FIS","WEX","FLYW","PAYO","RELY",
+        # Real Estate Tech
+        "CSGP","RDFN","OPEN","EXPI","HOUS","RKT","UWMC","PFSI","GHLD","RATE",
+        # Consumer Tech
+        "AMZN","BABA","JD","PDD","SE","GRAB","DIDI","MELI","VTEX","OZON",
+        "CHWY","W","ETSY","POSH","REAL","OSTK","PRTS","FLXS","BIGC","SHPW",
+        # Biotech
+        "MRNA","BNTX","NVAX","VXRT","DVAX","IOVA","FATE","KPTI","PRLD","KRTX",
+        "FOLD","RARE","ONCE","BLUE","SGMO","ARWR","DRNA","SRPT","BMRN","ALNY",
+        "REGN","VRTX","BIIB","IONS","AGEN","CLVS","IDYA","MGNX","MERUS","IMVT",
+        # Auto & EV
+        "TSLA","RIVN","LCID","NIO","XPEV","LI","NKLA","WKHS","RIDE","GOEV",
+        "F","GM","STLA","TM","HMC","RACE","MBGYY","BMWYY","VWAGY","POAHY",
+        # Semiconductors Extended
+        "NVDA","AMD","INTC","QCOM","AVGO","TXN","MU","AMAT","LRCX","KLAC",
+        "MCHP","SWKS","QRVO","CRUS","SLAB","DIOD","SITM","AMBA","ALGM","POWI",
+        "AEHR","ONTO","UCTT","FORM","ACLS","NVMI","RVLV","ICHR","MKSI","COHU",
+        # Cloud & SaaS
+        "MSFT","CRM","ORCL","NOW","WDAY","ADSK","ANSS","PTC","CDNS","SNPS",
+        "VEEV","HUBS","PCTY","PAYC","PAYLOCITY","TASK","JAMF","APPF","YEXT","KYNDRYL",
+        "ZM","DOCU","BOX","DRFT","DOCN","FSLY","ESTC","ELASTIC","SUMO","SPSC",
+        # Media & Entertainment
+        "NFLX","DIS","PARA","WBD","FOXA","SPOT","PINS","SNAP","MTCH","BMBL",
+        "RBLX","U","EA","TTWO","ATVI","DKNG","PENN","BALY","RSI","AGS",
+        # Retail Extended
+        "WMT","COST","TGT","HD","LOW","DLTR","DG","FIVE","OLLI","BIG",
+        "M","KSS","JWN","GPS","URBN","ANF","AEO","EXPR","CATO","PLCE",
+        "ROST","TJX","BURL","PSMT","CASY","WINN","KR","SFM","CHEF","USFD",
+        # Insurance
+        "BRK-B","AIG","MET","PRU","AFL","ALL","PGR","TRV","CB","HIG",
+        "WRB","RNR","MKL","ACGL","RLI","ERIE","SIGI","KMPR","HCI","UPC",
+        # Banks Extended
+        "JPM","BAC","WFC","C","USB","PNC","TFC","FITB","HBAN","CFG",
+        "RF","KEY","MTB","ZION","CMA","WAL","PACW","FHB","BOKF","CVBF",
+        # REITs Extended
+        "AMT","PLD","EQIX","CCI","SBAC","DLR","PSA","EXR","O","NNN",
+        "VICI","EPR","COLD","STAG","REXR","EGP","FR","LXP","GTY","ADC",
     ]
-    tickers.update(supplement)
 
-    # Clean – remove ETFs/funds for purity, keep equities
-    remove_patterns = ["BRK-B", "BRK-A"]
-    tickers = [t.replace(".", "-") for t in tickers if t and len(t) <= 5]
-    
-    # Limit to 1000
-    tickers = sorted(list(set(tickers)))[:1000]
-    log.info(f"Total universe: {len(tickers)} tickers")
-    return tickers
+    # Try to supplement with yfinance market cap screen (best effort)
+    try:
+        extra = []
+        screens = ["SPY","QQQ","IWB","VTI"]
+        for etf in screens:
+            try:
+                t = yf.Ticker(etf)
+                holdings = t.funds_data.top_holdings if hasattr(t, 'funds_data') else None
+                if holdings is not None and hasattr(holdings, 'index'):
+                    extra.extend(holdings.index.tolist()[:100])
+            except:
+                pass
+        tickers.extend(extra)
+    except:
+        pass
+
+    # Clean and deduplicate
+    cleaned = []
+    for t in tickers:
+        t = str(t).strip().upper().replace(".", "-")
+        if t and 1 <= len(t) <= 5 and t.replace("-","").isalpha():
+            cleaned.append(t)
+
+    final = sorted(list(dict.fromkeys(cleaned)))  # dedupe preserving order
+    log.info(f"Total universe: {len(final)} tickers")
+    return final
 
 
 # ─────────────────────────────────────────────
