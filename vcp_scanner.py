@@ -522,45 +522,45 @@ def analyze(ticker: str, df: pd.DataFrame, spy: pd.DataFrame) -> Optional[VCPRes
         except:
             company = ticker
 
-        # ── Disqualification — STRICT gates ────────────────────────────────
+        # ── Disqualification — STRICT but realistic gates ──────────────────
         dq_reasons = []
 
-        # Gate 1: ALL 8 Trend Template criteria must pass
-        if tt["passed"] < 8:
+        # Gate 1: Trend Template ≥ 7/8 (MM purist = 8/8, allow 1 miss)
+        if tt["passed"] < 7:
             failed = [k for k,v in tt.items()
                       if k not in ("passed","score","ma200_slope") and not v]
-            dq_reasons.append(f"TrendTemplate {tt['passed']}/8 (failed: {', '.join(failed)})")
+            dq_reasons.append(f"TrendTemplate {tt['passed']}/8 — failed: {', '.join(failed[:3])}")
 
-        # Gate 2: Stage 2 — MA200 slope must be positive (≥ 1%)
-        if tt["ma200_slope"] < 1.0:
-            dq_reasons.append(f"MA200 slope too flat ({tt['ma200_slope']:.1f}%)")
+        # Gate 2: MA200 must be rising (slope > 0.3% over 20 days)
+        # Ensures Stage 2 — flat/falling MA200 means wrong stage
+        if tt["ma200_slope"] < 0.3:
+            dq_reasons.append(f"MA200 not rising ({tt['ma200_slope']:.2f}%, need >0.3%)")
 
-        # Gate 3: Prior uptrend ≥ 30%
-        if not pu["valid"]:
-            dq_reasons.append(f"No prior uptrend (only +{pu['pct']:.1f}%)")
+        # Gate 3: Prior uptrend ≥ 20% before the base
+        # Stock must have a significant run before forming the base
+        if pu["pct"] < 20.0:
+            dq_reasons.append(f"Prior uptrend too small (+{pu['pct']:.1f}%, need ≥20%)")
 
-        # Gate 4: RS ≥ 70
-        if rs["rs"] < 70:
-            dq_reasons.append(f"RS too low ({rs['rs']:.0f} < 70)")
+        # Gate 4: RS ≥ 65 — must be outperforming the market
+        if rs["rs"] < 65:
+            dq_reasons.append(f"RS weak ({rs['rs']:.0f}, need ≥65)")
 
-        # Gate 5: VCP must be strictly valid
-        if not vcp["valid"]:
-            reason = vcp.get("reason", "")
-            if not vcp.get("all_price_contracting"):
-                reason += " prices not all contracting"
-            if not vcp.get("all_vol_contracting"):
-                reason += " volume not all contracting"
-            if vcp.get("last_pct", 99) > 15:
-                reason += f" last contraction too wide ({vcp.get('last_pct',0):.1f}%)"
-            dq_reasons.append(f"VCP invalid: {reason.strip()}")
+        # Gate 5: VCP — price contractions must ALL be shrinking
+        # Volume contracting is preferred, last contraction ≤ 20%
+        if not vcp.get("all_price_contracting", False):
+            dq_reasons.append("VCP price contractions not all shrinking (key MM rule)")
+        if vcp.get("n", 0) < 2:
+            dq_reasons.append("VCP needs ≥2 contractions")
+        if vcp.get("last_pct", 99) > 20:
+            dq_reasons.append(f"Last contraction too wide ({vcp.get('last_pct',0):.1f}%, need ≤20%)")
 
-        # Gate 6: Volume must be drying up
-        if not vol["dry_up"]:
-            dq_reasons.append(f"Volume not drying up (ratio={vol['ratio']:.2f}, need <0.60)")
+        # Gate 6: Volume contracting during base (last 10d < 85% of MA50)
+        if vol["ratio"] > 0.85:
+            dq_reasons.append(f"Volume expanding during base (ratio={vol['ratio']:.2f}, need <0.85)")
 
-        # Gate 7: Liquidity
-        if vol["avg"] < 300_000:
-            dq_reasons.append(f"Illiquid (avg vol {vol['avg']:,.0f})")
+        # Gate 7: Minimum liquidity
+        if vol["avg"] < 200_000:
+            dq_reasons.append(f"Illiquid ({vol['avg']:,.0f} avg vol, need >200k)")
 
         disqualified = len(dq_reasons) > 0
 
