@@ -1,5 +1,5 @@
 """
-VCP Scanner v4 — 結合 Minervini SEPA 與 J Law META 戰法
+VCP Scanner v4 — 結合 Minervini SEPA 與 J Law META 戰法 (修復 JSON 儲存錯誤)
 =========================================================
 優化項目：
 1. 修復 Wikipedia S&P500 抓取的 403 Forbidden 錯誤
@@ -7,6 +7,7 @@ VCP Scanner v4 — 結合 Minervini SEPA 與 J Law META 戰法
 3. 增加基於 20MA 的動態移動停損點 (Trailing Stop)
 4. 多執行緒並發下載加速
 5. 動態 VCP 容錯機制與真實升勢計算
+6. 修正 NumPy 數據型態無法存入 JSON 的錯誤 (NpEncoder)
 """
 
 import os, json, smtplib, logging, time, random
@@ -22,6 +23,17 @@ from typing import Optional
 import pandas as pd
 import numpy as np
 import yfinance as yf
+
+# ── 解決 NumPy 數據無法 JSON 序列化的問題 ───────────────────────────────────
+class NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NpEncoder, self).default(obj)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -377,10 +389,10 @@ def main():
     log.info("="*65)
     log.info(f"掃描完成。合格標的: {len(qualifying)} | 淘汰: {dq_count}")
 
-    # 輸出結果
+    # 輸出結果，加入 cls=NpEncoder 解決型別錯誤
     out = [vars(r) for r in sorted(qualifying, key=lambda x: x.score, reverse=True)]
     with open("vcp_results.json","w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
+        json.dump(out, f, indent=2, ensure_ascii=False, cls=NpEncoder)
     log.info("結果已儲存至 → vcp_results.json")
 
 if __name__ == "__main__":
