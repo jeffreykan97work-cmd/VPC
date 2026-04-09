@@ -1,14 +1,17 @@
 """
-VCP Scanner v3 — 強化版 Minervini SEPA 掃描器
-====================================================
+VCP Scanner v4 — 結合 Minervini SEPA 與 J Law META 戰法
+=========================================================
 優化項目：
-1. 動態計算先前升勢 (Prior Uptrend)
-2. 加入 VCP 收縮容錯機制 (Tolerance)
-3. 動態抓取 S&P 500 成分股擴充掃描池
-4. 使用 ThreadPoolExecutor 多執行緒加速下載並減少超時錯誤
+1. 修復 Wikipedia S&P500 抓取的 403 Forbidden 錯誤
+2. 導入 J Law META 戰法 (10MA/20MA/50MA/200MA 多頭排列檢測)
+3. 增加基於 20MA 的動態移動停損點 (Trailing Stop)
+4. 多執行緒並發下載加速
+5. 動態 VCP 容錯機制與真實升勢計算
 """
 
 import os, json, smtplib, logging, time, random
+import requests
+import io
 import concurrent.futures
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
@@ -40,12 +43,17 @@ class VCPResult:
     grade: str
     price: float
     pivot: float
-    stop: float
+    stop: float               # 靜態破底停損
+    trailing_stop_20ma: float # J Law 動態 20MA 防守線
     risk_pct: float
     reward_ratio: float
+    
+    # 趨勢與 J Law META 狀態
     tt_passed: int
     tt_score: float
     ma200_slope_20d: float
+    jlaw_meta_aligned: bool   # 是否符合 Price > 10 > 20 > 50 > 200
+    
     prior_uptrend_pct: float
     num_contractions: int
     all_price_contracting: bool
@@ -57,43 +65,53 @@ class VCPResult:
     disqualified: bool
     dq_reasons: list = field(default_factory=list)
 
-# ── 動態獲取股票宇宙 ────────────────────────────────────────────────────────
+# ── 動態獲取股票宇宙 (修復 403 錯誤) ─────────────────────────────────────────
 def get_tickers() -> list:
     tickers = []
-    # 嘗試動態抓取 S&P 500
+    
     try:
-        sp500_table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]
-        # Yahoo Finance 使用 '-' 代替 '.' (例如 BRK.B -> BRK-B)
+        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status() 
+        
+        sp500_table = pd.read_html(io.StringIO(response.text))[0]
         sp500_tickers = sp500_table['Symbol'].str.replace('.', '-', regex=False).tolist()
         tickers.extend(sp500_tickers)
         log.info(f"成功抓取 {len(sp500_tickers)} 檔 S&P 500 成分股")
+        
     except Exception as e:
         log.warning(f"無法抓取 S&P 500，將使用備用清單: {e}")
 
     # 加入精選高成長科技/動能股作為補充
     growth_tickers = [
         "PLTR","CELH","ELF","APP","MSTR","SMCI","HOOD","COIN","DUOL","CRWD",
-        "PANW","DDOG","MDB","NET","SNOW","SHOP","SE","MELI","ARM","IOT"
+        "PANW","DDOG","MDB","NET","SNOW","SHOP","SE","MELI","ARM","IOT",
+        "NVDA","TSLA","META","AVGO","AMD"
     ]
     tickers.extend(growth_tickers)
     
-    # 去除重複項
     return list(dict.fromkeys(tickers))
 
-# ── Data fetch (加入重試機制) ───────────────────────────────────────────────
+# ── Data fetch ──────────────────────────────────────────────────────────────
 def fetch(ticker: str, period="2y", retries=2) -> Optional[pd.DataFrame]:
     for attempt in range(retries):
         try:
-            # 加入隨機延遲避免觸發 HTTP 429 Too Many Requests
-            time.sleep(random.uniform(0.1, 0.5))
+            time.sleep(random.uniform(0.1, 0.4)) # 避免觸發 429
             df = yf.download(ticker, period=period, auto_adjust=True, progress=False, threads=False)
             if df is None or df.empty or len(df) < 150:
                 return None
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            
+            # yfinance>=0.2.40 有時會回傳 MultiIndex columns，將其攤平
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] for c in df.columns]
+                
             return df.dropna(subset=["Close","Volume"])
         except Exception as e:
             if "429" in str(e):
-                time.sleep(2) # 遇到 429 強制休息
+                time.sleep(2)
             if attempt == retries - 1:
                 return None
 
@@ -109,10 +127,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["Low52"]    = c.rolling(252).min()
     return df
 
-# ── Filter 1: Trend Template ────────────────────────────────────────────────
+# ── Filter 1: Trend Template & J Law META ───────────────────────────────────
 def check_trend_template(df: pd.DataFrame) -> dict:
     r = df.iloc[-1]
     p = float(r["Close"])
+    ma10, ma20 = float(r.get("MA10", np.nan)), float(r.get("MA20", np.nan))
     ma50, ma150, ma200 = float(r.get("MA50", np.nan)), float(r.get("MA150", np.nan)), float(r.get("MA200", np.nan))
     h52, l52 = float(r.get("High52", np.nan)), float(r.get("Low52", np.nan))
 
@@ -138,23 +157,30 @@ def check_trend_template(df: pd.DataFrame) -> dict:
     c["near_52w_high"] = ok(h52) and h52 > 0 and p >= h52 * 0.75
     c["above_52w_low"] = ok(l52) and l52 > 0 and p >= l52 * 1.30
 
+    # J Law META Alignment: 完美多頭排列 (強力攻擊姿態)
+    meta_aligned = ok(ma10) and ok(ma20) and ok(ma50) and ok(ma200) and \
+                   (p > ma10 > ma20 > ma50 > ma200)
+
     passed = sum(c.values())
-    return {**c, "passed": passed, "score": passed / 8 * 100, "ma200_slope": slope}
+    return {
+        **c, 
+        "passed": passed, 
+        "score": passed / 8 * 100, 
+        "ma200_slope": slope,
+        "meta_aligned": meta_aligned,
+        "ma20_val": ma20
+    }
 
 # ── Filter 2: 動態計算先前的升勢 ──────────────────────────────────────────
 def check_prior_uptrend(df: pd.DataFrame) -> dict:
     if len(df) < 200:
         return {"valid": False, "pct": 0}
 
-    # 在最近 120 天內尋找潛在底基的高點 (Base High)
     base_window = df.tail(120)
     high_idx = base_window["Close"].idxmax()
     high_price = float(df.loc[high_idx, "Close"])
     
-    # 獲取該高點在整個 dataframe 中的絕對索引
     abs_idx = df.index.get_loc(high_idx)
-    
-    # 往前回溯 60-150 天尋找起漲點 (Prior Low)
     if abs_idx < 60:
         return {"valid": False, "pct": 0}
         
@@ -174,7 +200,7 @@ def calc_rs(df: pd.DataFrame, spy: pd.DataFrame) -> dict:
     sp = perf(spy,63)*0.40 + perf(spy,126)*0.20 + perf(spy,252)*0.40
     rel = s - sp
     
-    rs = 50 + (rel * 1.5) # 簡化版映射
+    rs = 50 + (rel * 1.5) 
     rs = min(99, max(1, rs))
     return {"rs": round(rs,1), "score": round(rs,1)}
 
@@ -184,7 +210,6 @@ def detect_vcp(df: pd.DataFrame) -> dict:
     close = window["Close"].values.astype(float)
     vol   = window["Volume"].values.astype(float)
 
-    # 稍微放寬波段判斷區間
     order = 5 
     highs_idx, lows_idx = [], []
     for i in range(order, len(close)-order):
@@ -212,8 +237,7 @@ def detect_vcp(df: pd.DataFrame) -> dict:
 
     all_price_ok = True
     for i in range(1, len(contractions)):
-        # 容許 10% 的誤差，避免稍微突出就被判定無效
-        if contractions[i]["pct"] > contractions[i-1]["pct"] * 1.10:
+        if contractions[i]["pct"] > contractions[i-1]["pct"] * 1.10: # 10% 容錯
             all_price_ok = False
             
     last_pct = contractions[-1]["pct"]
@@ -257,33 +281,41 @@ def analyze(ticker: str, df: pd.DataFrame, spy: pd.DataFrame) -> Optional[VCPRes
         vcp = detect_vcp(df)
         vol = check_volume(df)
 
-        company = ticker # 簡化處理以加速
-
         dq_reasons = []
         if tt["passed"] < 6: dq_reasons.append(f"TrendTemplate {tt['passed']}/8")
-        if pu["pct"] < 25.0: dq_reasons.append(f"Prior uptrend weak (+{pu['pct']}%)")
+        if pu["pct"] < 25.0: dq_reasons.append(f"Prior uptrend weak (+{pu['pct']:.0f}%)")
         if rs["rs"] < 60:    dq_reasons.append(f"RS weak ({rs['rs']})")
         if vol["avg"] < 300_000: dq_reasons.append("Illiquid")
         
-        # 放寬條件：即使不是完美的遞減，只要最後一次收縮夠緊密也算過關
         if not vcp["all_price_contracting"] and vcp.get("last_pct", 100) > 12:
-            dq_reasons.append("VCP not shrinking and last > 12%")
+            dq_reasons.append("VCP not shrinking & last > 12%")
 
         disqualified = len(dq_reasons) > 0
 
+        # 計分加權 (若符合 J Law META，給予額外 10 分加權)
         composite = (vcp["score"]*0.35 + tt["score"]*0.25 + vol["score"]*0.20 + rs["score"]*0.20)
-        grade = "A" if composite >= 80 else ("B" if composite >= 65 else "C")
+        if tt["meta_aligned"]:
+            composite = min(100, composite + 10)
+
+        grade = "A+" if composite >= 90 else ("A" if composite >= 80 else ("B" if composite >= 65 else "C"))
 
         # Pivot & Stop calculation
         recent = df.tail(30)
         pivot = float(recent["High"].max())
-        stop = max(float(recent["Low"].tail(15).min()), price * 0.92)
+        stop = max(float(recent["Low"].tail(15).min()), price * 0.92) # 靜態波段停損
+        
+        # J Law 20MA 動態防守線
+        ma20 = float(tt["ma20_val"])
+        trailing_stop_20ma = round(ma20, 2)
 
         return VCPResult(
-            ticker=ticker, company=company, score=round(composite,1), grade=grade,
-            price=price, pivot=round(pivot,2), stop=round(stop,2),
-            risk_pct=round((price-stop)/price*100, 2), reward_ratio=round(((pivot*1.2)-price)/(price-stop), 2) if (price-stop)>0 else 0,
+            ticker=ticker, company=ticker, score=round(composite,1), grade=grade,
+            price=price, pivot=round(pivot,2), stop=round(stop,2), 
+            trailing_stop_20ma=trailing_stop_20ma,
+            risk_pct=round((price-stop)/price*100, 2), 
+            reward_ratio=round(((pivot*1.2)-price)/(price-stop), 2) if (price-stop)>0 else 0,
             tt_passed=tt["passed"], tt_score=tt["score"], ma200_slope_20d=tt["ma200_slope"],
+            jlaw_meta_aligned=tt["meta_aligned"],
             prior_uptrend_pct=pu["pct"], num_contractions=vcp.get("n",0),
             all_price_contracting=vcp.get("all_price_contracting",False), last_contraction_pct=vcp.get("last_pct",0),
             vol_dry_up=vol["dry_up"], vol_dry_up_ratio=vol["ratio"], avg_daily_vol=vol["avg"],
@@ -293,11 +325,11 @@ def analyze(ticker: str, df: pd.DataFrame, spy: pd.DataFrame) -> Optional[VCPRes
         log.debug(f"{ticker} 處理錯誤: {e}")
         return None
 
-# ── Main 多執行緒架構 ───────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────────────────────
 def main():
-    log.info("="*60)
-    log.info("🔍 VCP Scanner v3 — 多執行緒優化版")
-    log.info("="*60)
+    log.info("="*65)
+    log.info("🔍 VCP Scanner v4 — Minervini SEPA x J Law META")
+    log.info("="*65)
 
     spy_df = fetch("SPY", retries=3)
     if spy_df is None:
@@ -311,11 +343,9 @@ def main():
     qualifying = []
     dq_count = 0
 
-    # 使用 ThreadPoolExecutor 並發處理
-    MAX_WORKERS = 10 # 若網絡不穩可調低至 5
+    MAX_WORKERS = 10 
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # 建立 Future 字典
         future_to_ticker = {executor.submit(fetch, t): t for t in tickers}
         
         processed_count = 0
@@ -338,19 +368,19 @@ def main():
                 dq_count += 1
                 continue
 
-            # 只有評分 >= 65 才記錄
             if r.score >= 65:
                 qualifying.append(r)
+                meta_flag = "🌟 META Align" if r.jlaw_meta_aligned else ""
                 log.info(f"  ✅ {t} [{r.grade}] | VCP={r.num_contractions}x | "
-                         f"Last_C={r.last_contraction_pct:.1f}% | Uptrend={r.prior_uptrend_pct:.1f}%")
+                         f"RS={r.rs_rating:.0f} | 20MA防守=${r.trailing_stop_20ma} {meta_flag}")
 
-    log.info("="*60)
+    log.info("="*65)
     log.info(f"掃描完成。合格標的: {len(qualifying)} | 淘汰: {dq_count}")
 
     # 輸出結果
     out = [vars(r) for r in sorted(qualifying, key=lambda x: x.score, reverse=True)]
-    with open("vcp_results.json","w") as f:
-        json.dump(out, f, indent=2)
+    with open("vcp_results.json","w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
     log.info("結果已儲存至 → vcp_results.json")
 
 if __name__ == "__main__":
