@@ -34,15 +34,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run VCP Scanner
+     - name: Run VCP Scanner
         env:
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
-          EMAIL_SENDER:    ${{ secrets.EMAIL_SENDER }}
-          EMAIL_PASSWORD:  ${{ secrets.EMAIL_PASSWORD }}
-          MIN_SCORE:       ${{ github.event.inputs.min_score || '65' }}
-          MIN_GRADE:       ${{ github.event.inputs.min_grade || 'B' }}
-        run: |
-          python vcp_scanner.py
+          MIN_SCORE: ${{ github.event.inputs.min_score || '65' }}
+          MIN_GRADE: ${{ github.event.inputs.min_grade || 'B' }}
+        run: python vcp_scanner.py
 
       - name: Upload VCP Results
         if: always()
