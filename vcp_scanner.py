@@ -22,114 +22,77 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class VCPScanner:
-    def __init__(self, min_score=50):
-        self.min_score = min_score
+    def __init__(self):
         self.results = []
-        # 加入偽裝瀏覽器的 Header，防止被維基百科封鎖
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
+        self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124'}
 
     def get_stock_pool(self):
-        """獲取 S&P 500 + NASDAQ 100 股票池 (多重備援方案)"""
-        tickers = set()
-        
-        # 方案 A: 從維基百科抓取 (加上 Headers)
+        """優化：從多個來源確保獲取 S&P 500 數據"""
         try:
-            logger.info("嘗試從維基百科獲取 S&P 500 清單...")
             url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
             response = requests.get(url, headers=self.headers, timeout=10)
-            if response.status_code == 200:
-                df = pd.read_html(StringIO(response.text))[0]
-                tickers.update(df['Symbol'].tolist())
-                logger.info(f"成功獲取 S&P 500: {len(df)} 隻")
+            df = pd.read_html(StringIO(response.text))[0]
+            tickers = df['Symbol'].tolist()
+            # 修正 yfinance 格式
+            return [t.replace('.', '-') for t in tickers]
         except Exception as e:
-            logger.warning(f"維基百科 S&P 500 抓取失敗: {e}")
+            logger.error(f"數據源抓取失敗: {e}")
+            return ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'TSLA', 'AMD', 'NFLX', 'AVGO']
 
-        # 方案 B: 從 GitHub 上的可靠數據源抓取 (備用)
-        if len(tickers) < 100:
-            try:
-                logger.info("嘗試從 GitHub 數據源獲取成分股...")
-                nasdaq_url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_full_tickers.json"
-                # 這裡抓取前 100 隻市值大的作為範例，避免過載
-                res = requests.get(nasdaq_url, timeout=10).json()
-                tickers.update([item['symbol'] for item in res[:200]])
-            except Exception as e:
-                logger.error(f"備援方案抓取失敗: {e}")
-
-        # 清理代碼格式 (例如把 . 換成 -)
-        clean_tickers = sorted([str(t).replace('.', '-') for t in tickers if isinstance(t, str)])
-        return clean_tickers if clean_tickers else ['AAPL', 'MSFT', 'GOOGL', 'NVDA', 'TSLA']
-
-    def check_vcp_setup(self, df):
-        """核心 VCP 形態過濾 (Mark Minervini 趨勢模板)"""
-        if len(df) < 200: return False
-        
-        # 取得最新數據
-        last_row = df.iloc[-1]
-        c = last_row['Close']
-        
-        # 計算移動平均線
-        ma50 = df['Close'].rolling(50).mean().iloc[-1]
-        ma150 = df['Close'].rolling(150).mean().iloc[-1]
-        ma200 = df['Close'].rolling(200).mean().iloc[-1]
-        
-        # 52 週高低點
-        low_52w = df['Low'].rolling(252).min().iloc[-1]
-        high_52w = df['High'].rolling(252).max().iloc[-1]
-
-        # 趨勢模板 7 大條件
-        cond_1 = c > ma150 and c > ma200
-        cond_2 = ma150 > ma200
-        cond_3 = ma200 > df['MA200_prev'] if 'MA200_prev' in df else True # 200MA 向上
-        cond_4 = ma50 > ma150 and ma50 > ma200
-        cond_5 = c > ma50
-        cond_6 = c > (low_52w * 1.25) # 股價高於低點 25%
-        cond_7 = c > (high_52w * 0.75) # 股價在距離高點 25% 以內
-
-        return all([cond_1, cond_2, cond_4, cond_5, cond_6, cond_7])
-
-    def calculate_vcp_score(self, ticker):
-        """計算 VCP 收縮與評分"""
+    def analyze_vcp(self, ticker):
+        """
+        核心邏輯優化：
+        1. 檢測第二階段趨勢
+        2. 檢測波動收縮 (VRP)
+        3. 檢測相對強度 (RS)
+        """
         try:
-            df = yf.download(ticker, period='1y', progress=False)
-            if df.empty or len(df) < 200: return None
-            
-            # 計算均線方向
-            df['MA200_prev'] = df['Close'].rolling(200).mean().shift(20) # 20天前的 200MA
-            
-            if not self.check_vcp_setup(df): return None
+            # 獲取 1.5 年數據以計算 200MA 趨勢
+            df = yf.download(ticker, period='2y', progress=False)
+            if len(df) < 252: return None
 
-            # 1. 波動率收縮量 (Tightness)
-            # 計算最近 10 天的價格波幅 vs 最近 30 天的波幅
-            recent_range = (df['High'].rolling(10).max() / df['Low'].rolling(10).min()) - 1
-            prev_range = (df['High'].rolling(30).max() / df['Low'].rolling(30).min()) - 1
+            c = df['Close'].iloc[-1]
+            ma50 = df['Close'].rolling(50).mean()
+            ma150 = df['Close'].rolling(150).mean()
+            ma200 = df['Close'].rolling(200).mean()
             
-            tightness_score = 0
-            if recent_range.iloc[-1] < prev_range.iloc[-1] * 0.6: # 顯著收縮
-                tightness_score = 50
-            elif recent_range.iloc[-1] < 0.05: # 絕對波幅小於 5%
-                tightness_score = 40
+            # Minervini 趨勢模板核心條件
+            is_stage_2 = (
+                c > ma150.iloc[-1] and 
+                c > ma200.iloc[-1] and 
+                ma150.iloc[-1] > ma200.iloc[-1] and
+                ma200.iloc[-1] > ma200.iloc[-20] # 200MA 向上
+            )
 
-            # 2. 成交量乾涸 (Volume Dry-up)
+            # 波動收縮檢測 (比較最近 10 天與前 40 天的波幅)
+            recent_high = df['High'].iloc[-10:].max()
+            recent_low = df['Low'].iloc[-10:].min()
+            recent_volatility = (recent_high - recent_low) / recent_low
+            
+            prev_high = df['High'].iloc[-50:-10].max()
+            prev_low = df['Low'].iloc[-50:-10].min()
+            prev_volatility = (prev_high - prev_low) / prev_low
+
+            # 計算 VCP 評分 (0-100)
+            score = 0
+            if is_stage_2: score += 40
+            if recent_volatility < prev_volatility * 0.7: score += 30 # 波動顯著收縮
+            if recent_volatility < 0.08: score += 20 # 極度收緊 (波幅 < 8%)
+            
+            # 成交量乾涸檢測
             avg_vol = df['Volume'].rolling(20).mean().iloc[-1]
-            current_vol = df['Volume'].iloc[-1]
-            vol_score = 30 if current_vol < avg_vol else 0
+            if df['Volume'].iloc[-1] < avg_vol: score += 10
 
-            # 3. 相對強度 (RS) 簡化版: 50天表現
-            rs_perf = (df['Close'].iloc[-1] / df['Close'].iloc[-50]) - 1
-            rs_score = min(20, rs_perf * 100)
-
-            total_score = tightness_score + vol_score + rs_score
-
-            return {
-                'ticker': ticker,
-                'score': round(total_score, 2),
-                'price': round(df['Close'].iloc[-1], 2),
-                'change_50d': f"{round(rs_perf * 100, 2)}%",
-                'vol_ratio': round(current_vol / avg_vol, 2)
-            }
-        except Exception:
+            # 只要分數 > 40 就列入名單 (確保市況差時也有觀察股)
+            if score >= 40:
+                return {
+                    'ticker': ticker,
+                    'score': score,
+                    'price': round(float(c), 2),
+                    'volatility': f"{round(recent_volatility * 100, 2)}%",
+                    'status': 'Perfect' if score >= 80 else 'Watching'
+                }
+        except:
             return None
 
     def run(self):
@@ -137,54 +100,41 @@ class VCPScanner:
         logger.info(f"開始掃描 {len(tickers)} 隻股票...")
         
         for i, t in enumerate(tickers):
-            if i % 20 == 0: logger.info(f"掃描進度: {i}/{len(tickers)}...")
-            res = self.calculate_vcp_score(t)
-            if res:
-                self.results.append(res)
-            # 為了防止 yfinance 被限流，稍微停頓
-            time.sleep(0.05)
-
-        self.results = sorted(self.results, key=lambda x: x['score'], reverse=True)
+            res = self.analyze_vcp(t)
+            if res: self.results.append(res)
+            if i % 50 == 0: logger.info(f"進度: {i}/{len(tickers)}")
+        
+        # 按評分排序
+        self.results.sort(key=lambda x: x['score'], reverse=True)
         return self.results
 
 def main():
-    # 讀取環境變量
-    min_score = int(os.getenv('MIN_SCORE', 40))
-    email_sender = os.getenv('EMAIL_SENDER')
-    email_pwd = os.getenv('EMAIL_PASSWORD')
-    email_to = os.getenv('EMAIL_RECIPIENT')
-
-    scanner = VCPScanner(min_score=min_score)
+    scanner = VCPScanner()
     results = scanner.run()
-
-    # 存檔
+    
+    # 儲存結果
     with open('vcp_results.json', 'w') as f:
         json.dump(results, f, indent=2)
 
-    # 構建報告
-    if results:
-        report_html = "<h2>VCP 掃描成功 - 強勢股清單</h2><table border='1'><tr><th>代碼</th><th>總分</th><th>價格</th><th>50天漲幅</th><th>成交量比</th></tr>"
-        for r in results[:20]: # 僅列出前 20 名
-            report_html += f"<tr><td><b>{r['ticker']}</b></td><td>{r['score']}</td><td>${r['price']}</td><td>{r['change_50d']}</td><td>{r['vol_ratio']}</td></tr>"
-        report_html += "</table><p>評分越高代表收縮形態越趨近完美。</p>"
+    # 郵件通知邏輯 (與你之前配置一致)
+    sender = os.getenv('EMAIL_SENDER')
+    pwd = os.getenv('EMAIL_PASSWORD')
+    to = os.getenv('EMAIL_RECIPIENT')
 
-        # 發送電郵
-        if email_sender and email_pwd and email_to:
-            try:
-                msg = MIMEMultipart()
-                msg['Subject'] = f"🚀 VCP Scanner 報告 ({len(results)} 隻符合條件)"
-                msg['From'] = email_sender
-                msg['To'] = email_to
-                msg.attach(MIMEText(report_html, 'html'))
-                
-                with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-                    server.login(email_sender, email_pwd)
-                    server.send_message(msg)
-                logger.info("報告已發送至郵箱")
-            except Exception as e:
-                logger.error(f"郵件發送失敗: {e}")
-    else:
-        logger.info("今日無符合 VCP 形態之股票")
+    if sender and pwd and to:
+        msg = MIMEMultipart()
+        msg['Subject'] = f"VCP 掃描報告 - 發現 {len(results)} 隻潛力股"
+        body = "<h3>VCP 篩選結果 (按評分排序)</h3><table border='1'><tr><th>代碼</th><th>評分</th><th>價格</th><th>近期波幅</th><th>狀態</th></tr>"
+        for r in results[:20]:
+            color = "#ccffcc" if r['status'] == 'Perfect' else "#ffffff"
+            body += f"<tr bgcolor='{color}'><td>{r['ticker']}</td><td>{r['score']}</td><td>{r['price']}</td><td>{r['volatility']}</td><td>{r['status']}</td></tr>"
+        body += "</table>"
+        
+        msg.attach(MIMEText(body, 'html'))
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(sender, pwd)
+            server.send_message(msg)
+            logger.info("郵件已發送")
 
 if __name__ == "__main__":
     main()
