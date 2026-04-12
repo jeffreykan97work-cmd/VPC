@@ -2,7 +2,11 @@ name: VCP Scanner – Daily US Stock Alert
 
 on:
   schedule:
-    - cron: "0 22 * * 1-5"
+    # 美股開市前 30 分鐘 = 美東 09:00 = UTC 14:00
+    - cron: "0 14 * * 1-5"
+    # 美股收市後 30 分鐘 = 美東 16:30 = UTC 21:30
+    - cron: "30 21 * * 1-5"
+  
   workflow_dispatch:
     inputs:
       min_score:
@@ -23,10 +27,10 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: "3.10"
           cache: "pip"
 
       - name: Install Dependencies
@@ -34,14 +38,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-     - name: Run VCP Scanner
+      - name: Run VCP Scanner
         env:
-          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
-          MIN_SCORE: ${{ github.event.inputs.min_score || '65' }}
-          MIN_GRADE: ${{ github.event.inputs.min_grade || 'B' }}
-        run: python vcp_scanner.py
+          EMAIL_SENDER:    ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD:  ${{ secrets.EMAIL_PASSWORD }}
+          MIN_SCORE:       ${{ github.event.inputs.min_score || '65' }}
+          MIN_GRADE:       ${{ github.event.inputs.min_grade || 'B' }}
+        run: |
+          python vcp_scanner.py
 
       - name: Upload VCP Results
         if: always()
