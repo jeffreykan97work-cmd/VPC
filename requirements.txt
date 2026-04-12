@@ -1,7 +1,5 @@
-pandas==2.1.4
-numpy==1.24.4
-requests==2.31.0
-tvdatafeed==0.4.6
-pandas-datareader==0.10.0
-yfinance==0.2.33
-python-dotenv==1.0.0
+pandas==2.0.3
+numpy==1.24.3
+requests
+yfinance
+pandas-datareader
