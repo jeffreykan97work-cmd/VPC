@@ -1,15 +1,20 @@
-name: VCP Scanner Daily Alert
+name: VCP Scanner - Daily US Stock Alert
 
 on:
   schedule:
-    - cron: "0 22 * * 1-5"  # 美股收盤後運行
+    - cron: "0 22 * * 1-5"  # 美股收盤後
   workflow_dispatch:
+    inputs:
+      min_score:
+        description: "最低評分門檻 (0-100)"
+        required: false
+        default: "50"
 
 jobs:
-  vcp-scan:
+  scan:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -21,15 +26,18 @@ jobs:
         run: |
           pip install pandas yfinance lxml html5lib beautifulsoup4 numpy
 
-      - name: Run Scanner
+      - name: Run VCP Scanner
         env:
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+          MIN_SCORE: ${{ github.event.inputs.min_score || '50' }}
         run: python vcp_scanner.py
 
-      - name: Upload Results
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vcp-report
-          path: vcp_results.json
+          name: vcp-results
+          path: |
+            vcp_results.json
+            vcp_scan.log
