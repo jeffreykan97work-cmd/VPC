@@ -79,6 +79,9 @@ class DataFetcher:
             df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
             if df.empty or len(df) < 200:
                 return None
+            # yfinance 新版回傳 MultiIndex columns，壓平成單層避免 FutureWarning
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
             return df
         except Exception as e:
             logger.debug(f"{ticker} 下載失敗：{e}")
