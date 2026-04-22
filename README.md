@@ -151,7 +151,7 @@ ONLY_BUY_RECOMMENDATION: "true"  # 只輸出分析師判定可買（BUY）的股
 
 ### 修改掃描股票池
 
-在 `vcp_scanner.py` 的 `get_top1000_tickers()` 函數中調整。
+在 `vcp_scanner.py` 的 `get_sp500_tickers()` 函數中調整。
 
 ---
 

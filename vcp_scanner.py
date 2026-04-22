@@ -293,7 +293,8 @@ class AnalystEngine:
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(period).mean()
         loss = (-delta.clip(upper=0)).rolling(period).mean()
-        rs = gain / loss.replace(0, np.nan)
+        # loss = 0 代表近期幾乎無下跌，RSI 應偏高而非回到中性
+        rs = gain / loss.replace(0, 1e-10)
         rsi = 100 - (100 / (1 + rs))
         if pd.isna(rsi.iloc[-1]):
             return 50.0
@@ -318,7 +319,8 @@ class AnalystEngine:
 
         # 入場：突破 pivot 後再加 0.5% 緩衝，減少假突破
         entry = round(max(last_close, pivot * 1.005), 2)
-        stop_loss = round(min(support_20d * 0.99, entry * 0.93), 2)
+        # 停損以「較近」者為主，避免風險過寬
+        stop_loss = round(max(support_20d * 0.99, entry * 0.93), 2)
         risk = max(entry - stop_loss, 0.01)
 
         # 目標：至少 2R，並參考短期壓力上方
@@ -366,6 +368,7 @@ class VCPScanner:
             "trend_template": 0,
             "insufficient_contractions": 0,
             "score_below_min": 0,
+            "not_buy_signal": 0,
         }
         self.near_misses: list[dict] = []
 
@@ -440,7 +443,7 @@ class VCPScanner:
                 result = self.analyse_ticker(ticker, spy_df)
                 if result and result["score"] >= self.min_score:
                     if self.only_buy_recommendation and result["recommendation"] != "BUY":
-                        self.rejections["score_below_min"] += 1
+                        self.rejections["not_buy_signal"] += 1
                         self.near_misses.append(result)
                         continue
                     self.results.append(result)
