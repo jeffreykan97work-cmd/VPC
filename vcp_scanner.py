@@ -315,16 +315,20 @@ class AnalystEngine:
         avg_vol_20 = float(volume.rolling(20).mean().iloc[-1])
         vol_ratio = float(volume.iloc[-1] / avg_vol_20) if avg_vol_20 > 0 else 1.0
         support_20d = float(low.iloc[-20:].min())
-        resistance_20d = float(high.iloc[-20:].max())
+        resistance_60d = float(high.iloc[-60:].max())
 
         # 入場：突破 pivot 後再加 0.5% 緩衝，減少假突破
         entry = round(max(last_close, pivot * 1.005), 2)
-        # 停損以「較近」者為主，避免風險過寬
-        stop_loss = round(max(support_20d * 0.99, entry * 0.93), 2)
+        # 停損以「較近」者為主，避免風險過寬；同時確保停損低於入場價
+        raw_stop = max(support_20d * 0.995, entry * 0.97)
+        stop_loss = round(min(raw_stop, entry * 0.995), 2)
         risk = max(entry - stop_loss, 0.01)
 
-        # 目標：至少 2R，並參考短期壓力上方
-        take_profit = round(max(entry + 2 * risk, resistance_20d * 1.03), 2)
+        # 目標價優先以壓力區推估，若壓力太近才退回固定 R 倍數
+        raw_take_profit = resistance_60d * 1.02
+        if raw_take_profit <= entry:
+            raw_take_profit = entry + 1.5 * risk
+        take_profit = round(raw_take_profit, 2)
         risk_reward = round((take_profit - entry) / risk, 2)
 
         momentum_ok = 50 <= rsi <= 75
@@ -356,7 +360,7 @@ class VCPScanner:
         min_score: int = 50,
         trend_min_passed: int = 8,
         min_contractions: int = 1,
-        only_buy_recommendation: bool = True,
+        only_buy_recommendation: bool = False,
     ):
         self.min_score = min_score
         self.trend_min_passed = max(5, min(trend_min_passed, 9))
@@ -553,7 +557,7 @@ def main():
     min_score = int(os.getenv("MIN_SCORE", "50"))
     trend_min_passed = int(os.getenv("TREND_MIN_PASSED", "8"))
     min_contractions = int(os.getenv("MIN_CONTRACTIONS", "1"))
-    only_buy_recommendation = os.getenv("ONLY_BUY_RECOMMENDATION", "true").lower() == "true"
+    only_buy_recommendation = os.getenv("ONLY_BUY_RECOMMENDATION", "false").lower() == "true"
 
     logger.info(
         "目前設定：MIN_SCORE=%s, TREND_MIN_PASSED=%s/9, MIN_CONTRACTIONS=%s, ONLY_BUY_RECOMMENDATION=%s",

@@ -144,7 +144,7 @@ python vcp_scanner.py
 MIN_SCORE: "50"          # 總分門檻（建議 45~60）
 TREND_MIN_PASSED: "8"    # MM 趨勢模板最少通過幾項（0~9，建議 7~8）
 MIN_CONTRACTIONS: "1"    # 最少收縮次數（建議 1，若行情弱可調成 0）
-ONLY_BUY_RECOMMENDATION: "true"  # 只輸出分析師判定可買（BUY）的股票
+ONLY_BUY_RECOMMENDATION: "false" # 是否只輸出 BUY（建議先 false，避免清單過少）
 ```
 
 > 若你常常「完全沒有股票」，先把 `MIN_SCORE` 降到 45，或把 `TREND_MIN_PASSED` 由 8 降到 7，通常就能看到候選名單。
