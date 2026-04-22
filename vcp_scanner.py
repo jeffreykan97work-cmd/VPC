@@ -283,22 +283,37 @@ class ScoringEngine:
 
 class VCPScanner:
 
-    def __init__(self, min_score: int = 50):
+    def __init__(self, min_score: int = 50, trend_min_passed: int = 8, min_contractions: int = 1):
         self.min_score = min_score
+        self.trend_min_passed = max(5, min(trend_min_passed, 9))
+        self.min_contractions = max(0, min_contractions)
         self.results: list[dict] = []
+        self.rejections: dict[str, int] = {
+            "data_unavailable": 0,
+            "trend_template": 0,
+            "insufficient_contractions": 0,
+            "score_below_min": 0,
+        }
+        self.near_misses: list[dict] = []
 
     def analyse_ticker(self, ticker: str, spy_df: pd.DataFrame | None) -> dict | None:
         df = DataFetcher.download(ticker)
         if df is None:
+            self.rejections["data_unavailable"] += 1
             return None
 
         # ── 趨勢模板前置篩選 ─────────────────────────────
         passed_template, passed_count = TrendAnalyzer.check_trend_template(df)
-        if not passed_template:
-            return None   # 不符合趨勢模板，直接略過
+        if passed_count < self.trend_min_passed:
+            self.rejections["trend_template"] += 1
+            return None
 
         # ── VCP 形態分析 ──────────────────────────────────
         vcp_info = VCPAnalyzer.detect_contractions(df)
+        if vcp_info["contractions"] < self.min_contractions:
+            self.rejections["insufficient_contractions"] += 1
+            return None
+
         pivot    = VCPAnalyzer.calc_pivot(df)
 
         # ── 評分 ──────────────────────────────────────────
@@ -321,6 +336,7 @@ class VCPScanner:
             "ticker":         ticker,
             "score":          total,
             "grade":          score_to_grade(total),
+            "trend_template_passed": passed_template,
             "price":          round(last_close, 2),
             "pivot":          round(pivot, 2),
             "stop_loss":      round(last_close * 0.92, 2),   # 簡易停損（-8%）
@@ -345,6 +361,9 @@ class VCPScanner:
                 if result and result["score"] >= self.min_score:
                     self.results.append(result)
                     logger.info(f"  ✅ {ticker} | 分數：{result['score']} | 等級：{result['grade']}")
+                elif result:
+                    self.rejections["score_below_min"] += 1
+                    self.near_misses.append(result)
             except Exception as e:
                 logger.debug(f"{ticker} 分析例外：{e}")
 
@@ -353,7 +372,18 @@ class VCPScanner:
             time.sleep(0.1)
 
         self.results.sort(key=lambda x: x["score"], reverse=True)
-        logger.info(f"掃描完成，共 {len(self.results)} 隻符合條件")
+        self.near_misses.sort(key=lambda x: x["score"], reverse=True)
+
+        logger.info(
+            "掃描完成，共 %s 隻符合條件；淘汰統計：%s",
+            len(self.results),
+            self.rejections,
+        )
+        if not self.results and self.near_misses:
+            logger.info(
+                "目前無達標股票，最接近門檻前 5 名：%s",
+                [f"{x['ticker']}({x['score']})" for x in self.near_misses[:5]],
+            )
         return self.results
 
 
@@ -426,8 +456,22 @@ class EmailNotifier:
 
 def main():
     min_score = int(os.getenv("MIN_SCORE", "50"))
-    scanner   = VCPScanner(min_score=min_score)
-    results   = scanner.run()
+    trend_min_passed = int(os.getenv("TREND_MIN_PASSED", "8"))
+    min_contractions = int(os.getenv("MIN_CONTRACTIONS", "1"))
+
+    logger.info(
+        "目前設定：MIN_SCORE=%s, TREND_MIN_PASSED=%s/9, MIN_CONTRACTIONS=%s",
+        min_score,
+        trend_min_passed,
+        min_contractions,
+    )
+
+    scanner = VCPScanner(
+        min_score=min_score,
+        trend_min_passed=trend_min_passed,
+        min_contractions=min_contractions,
+    )
+    results = scanner.run()
 
     # 儲存 JSON
     out_path = f"results/vcp_{datetime.now().strftime('%Y-%m-%d')}.json"
