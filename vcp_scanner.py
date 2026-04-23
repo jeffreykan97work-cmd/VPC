@@ -554,10 +554,27 @@ class EmailNotifier:
 # ── 主程式 ────────────────────────────────────────────────────────────────────
 
 def main():
-    min_score = int(os.getenv("MIN_SCORE", "50"))
-    trend_min_passed = int(os.getenv("TREND_MIN_PASSED", "8"))
-    min_contractions = int(os.getenv("MIN_CONTRACTIONS", "1"))
-    only_buy_recommendation = os.getenv("ONLY_BUY_RECOMMENDATION", "false").lower() == "true"
+    def get_int_env(name: str, default: int) -> int:
+        raw = os.getenv(name, str(default)).strip()
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            logger.warning("環境變數 %s=%r 不是整數，改用預設值 %s", name, raw, default)
+            return default
+
+    def get_bool_env(name: str, default: bool) -> bool:
+        raw = os.getenv(name, str(default)).strip().lower()
+        if raw in {"1", "true", "yes", "y", "on"}:
+            return True
+        if raw in {"0", "false", "no", "n", "off"}:
+            return False
+        logger.warning("環境變數 %s=%r 不是布林值，改用預設值 %s", name, raw, default)
+        return default
+
+    min_score = get_int_env("MIN_SCORE", 50)
+    trend_min_passed = get_int_env("TREND_MIN_PASSED", 8)
+    min_contractions = get_int_env("MIN_CONTRACTIONS", 1)
+    only_buy_recommendation = get_bool_env("ONLY_BUY_RECOMMENDATION", False)
 
     logger.info(
         "目前設定：MIN_SCORE=%s, TREND_MIN_PASSED=%s/9, MIN_CONTRACTIONS=%s, ONLY_BUY_RECOMMENDATION=%s",

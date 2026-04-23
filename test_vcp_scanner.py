@@ -1,8 +1,10 @@
 import unittest
 import numpy as np
 import pandas as pd
+import os
+from unittest.mock import patch
 
-from vcp_scanner import AnalystEngine, VCPScanner
+from vcp_scanner import AnalystEngine, VCPScanner, main
 
 
 def make_sample_df(rows: int = 260, seed: int = 42) -> pd.DataFrame:
@@ -38,6 +40,19 @@ class TestScannerDefaults(unittest.TestCase):
         scanner = VCPScanner()
         self.assertFalse(scanner.only_buy_recommendation)
         self.assertIn("not_buy_signal", scanner.rejections)
+
+    @patch("vcp_scanner.VCPScanner.run", return_value=[])
+    def test_main_tolerates_invalid_env_values(self, _mock_run):
+        old_env = os.environ.copy()
+        try:
+            os.environ["MIN_SCORE"] = "abc"
+            os.environ["TREND_MIN_PASSED"] = "x9"
+            os.environ["MIN_CONTRACTIONS"] = "none"
+            os.environ["ONLY_BUY_RECOMMENDATION"] = "maybe"
+            main()  # should fallback to defaults instead of raising ValueError
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
 
 
 if __name__ == "__main__":
