@@ -1,176 +1,595 @@
-# 📈 VCP Scanner — Mark Minervini 自動選股系統
+#!/usr/bin/env python3
+"""
+VCP Scanner — Mark Minervini 自動選股系統
+基於《Trade Like a Stock Market Wizard》的 VCP 方法論
+"""
 
-> 基於 Mark Minervini《Trade Like a Stock Market Wizard》的 **Volatility Contraction Pattern (VCP)** 方法論，自動掃描美股前 1000 大股票，每個交易日收盤後寄送符合條件的股票清單至您的信箱。
+import os
+import json
+import logging
+import smtplib
+import time
+import requests
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from io import StringIO
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
----
+# ── 日誌設定 ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("vcp_scan.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
 
-## 🧠 VCP 核心要點（MM 方法論）
 
-### 什麼是 VCP？
+# ── 評分常數 ──────────────────────────────────────────────────────────────────
+SCORE_WEIGHTS = {
+    "vcp_quality":    30,   # VCP 收縮品質
+    "trend_template": 25,   # MM 趨勢模板（8 項）
+    "stage":          15,   # Stage 2 確認
+    "volume_pattern": 15,   # 量能模式
+    "rs":             10,   # 相對強度 vs S&P 500
+    "tightness":       5,   # 最後整理緊縮度
+}
+GRADE_MAP = [(85, "A+"), (75, "A"), (65, "B"), (50, "C")]
 
-VCP 是一種**價格波動收縮型態**（Volatility Contraction Pattern），是 Mark Minervini 在多年實戰中總結出的高勝率突破前型態。
 
-```
-     ┌─ 第1次收縮 ─┐  ┌─ 第2次 ─┐  ┌─ 第3次（最緊）─┐
-     │   -20%      │  │  -12%   │  │    -6%         │  ← 突破！
-─────┘             └──┘         └──┘                 └──────▶
-     Volume ██████      ████       ██        █ (放量突破)
-```
+def score_to_grade(score: float) -> str:
+    for threshold, grade in GRADE_MAP:
+        if score >= threshold:
+            return grade
+    return "D"
 
-### VCP 的 6 大核心原則
 
-| # | 原則 | 說明 |
-|---|------|------|
-| 1 | **波動收縮** | 每次回撤幅度比前一次更小（例：-25% → -15% → -8% → -4%） |
-| 2 | **量能萎縮** | 每次整理過程中成交量遞減，代表賣壓耗盡 |
-| 3 | **收縮次數** | 理想 2-4 次，最後一次收縮應極緊（<5%） |
-| 4 | **基部深度** | 整體回撤 15-50%，過淺或過深皆不理想 |
-| 5 | **放量突破** | 突破樞軸價位時成交量需 ≥ 均量 150% 以上 |
-| 6 | **Stage 2 確認** | 股票必須處於 Stan Weinstein 的第二階段（上升趨勢） |
+# ── 資料取得 ──────────────────────────────────────────────────────────────────
 
----
+class DataFetcher:
+    HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-## 📊 MM 趨勢模板（8 項必要條件）
+    @staticmethod
+    def get_sp500_tickers() -> list[str]:
+        """取得 S&P 500 成分股清單（Wikipedia）"""
+        try:
+            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            resp = requests.get(url, headers=DataFetcher.HEADERS, timeout=10)
+            resp.raise_for_status()
+            df = pd.read_html(StringIO(resp.text))[0]
+            tickers = [t.replace(".", "-") for t in df["Symbol"].tolist()]
+            logger.info(f"成功取得 {len(tickers)} 隻 S&P 500 成分股")
+            return tickers
+        except Exception as e:
+            logger.warning(f"無法取得 S&P 500 清單，使用備用清單：{e}")
+            return [
+                "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN",
+                "META", "TSLA", "AMD", "NFLX", "AVGO",
+            ]
 
-Minervini 的趨勢模板是進入 VCP 交易的**前置篩選器**，全部 8 項必須通過：
+    @staticmethod
+    def download(ticker: str, period: str = "1y") -> pd.DataFrame | None:
+        """下載股價資料，失敗時記錄具體錯誤"""
+        try:
+            df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+            if df.empty or len(df) < 200:
+                return None
+            # yfinance 新版回傳 MultiIndex columns，壓平成單層避免 FutureWarning
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return df
+        except Exception as e:
+            logger.debug(f"{ticker} 下載失敗：{e}")
+            return None
 
-```
-✅ 1. 股價 > 150日均線
-✅ 2. 股價 > 200日均線
-✅ 3. 150日均線 > 200日均線
-✅ 4. 200日均線呈上升趨勢（過去一個月）
-✅ 5. 50日均線 > 150日均線 且 50日均線 > 200日均線
-✅ 6. 股價 > 50日均線
-✅ 7. 股價距 52 週高點不超過 25%（接近高點）
-✅ 8. 股價比 52 週低點高出至少 30%（顯示上升動能）
-```
+    @staticmethod
+    def download_benchmark(period: str = "1y") -> pd.DataFrame | None:
+        """下載 SPY 作為大盤基準"""
+        return DataFetcher.download("SPY", period)
 
----
 
-## 🎯 評分系統
+# ── 核心分析 ──────────────────────────────────────────────────────────────────
 
-### 評分權重
+class TrendAnalyzer:
 
-| 維度 | 權重 | 說明 |
-|------|------|------|
-| VCP 收縮品質 | **30%** | 收縮次數、幅度遞減、量能遞減 |
-| MM 趨勢模板 | **25%** | 8 項均線排列條件 |
-| Stage 分析 | **15%** | 必須為 Stage 2（上升段） |
-| 量能模式 | **15%** | 基部量縮 + 突破量增 |
-| RS 相對強度 | **10%** | 相對 S&P 500 的表現 |
-| 緊縮度 | **5%** | 手柄/最後整理的緊縮程度 |
+    @staticmethod
+    def check_trend_template(df: pd.DataFrame) -> tuple[bool, int]:
+        """
+        MM 趨勢模板 — 8 項條件，全部通過才進入評分。
+        回傳 (是否通過, 通過項目數)，供評分參考。
+        """
+        close = df["Close"]
+        high  = df["High"]
+        low   = df["Low"]
 
-### 評分等級
+        c      = float(close.iloc[-1])
+        ma50   = float(close.rolling(50).mean().iloc[-1])
+        ma150  = float(close.rolling(150).mean().iloc[-1])
+        ma200  = float(close.rolling(200).mean().iloc[-1])
 
-| 等級 | 分數 | 意義 |
-|------|------|------|
-| **A+** | 85-100 | 教科書級 VCP，優先關注 |
-| **A**  | 75-84  | 高品質 VCP，值得追蹤 |
-| **B**  | 65-74  | 良好設置，需配合市場環境 |
-| **C**  | 50-64  | 尚在成形，可加入觀察清單 |
-| **D**  | <50    | 不符合條件，略過 |
+        # 200 日均線是否在過去 20 個交易日內上升
+        ma200_20d_ago = float(close.rolling(200).mean().iloc[-21])
+        ma200_rising  = ma200 > ma200_20d_ago
 
----
+        low_52w  = float(low.rolling(252).min().iloc[-1])
+        high_52w = float(high.rolling(252).max().iloc[-1])
 
-## 🛠️ 為什麼常常掃不到股票？
+        conditions = [
+            c > ma150,                    # 1. 股價 > 150MA
+            c > ma200,                    # 2. 股價 > 200MA
+            ma150 > ma200,                # 3. 150MA > 200MA
+            ma200_rising,                 # 4. 200MA 上升趨勢
+            ma50 > ma150,                 # 5a. 50MA > 150MA
+            ma50 > ma200,                 # 5b. 50MA > 200MA
+            c > ma50,                     # 6. 股價 > 50MA
+            c >= high_52w * 0.75,         # 7. 距 52 週高點 ≤25%
+            c >= low_52w * 1.30,          # 8. 超越 52 週低點 ≥30%
+        ]
+        passed = sum(conditions)
+        return all(conditions), passed
 
-常見原因：
-1. **趨勢模板過嚴**：原本需 9/9 全過，盤整市很容易全軍覆沒。
-2. **分數門檻過高**：若同時要求高分 + 完美模板，命中率會很低。
-3. **收縮條件過嚴**：有些強勢股還在早期整理，收縮次數未達理想值。
 
-新版會在 log 顯示淘汰統計（趨勢不符、收縮不足、分數不足），幫你快速找到瓶頸。
+class VCPAnalyzer:
 
----
+    @staticmethod
+    def detect_contractions(df: pd.DataFrame) -> dict:
+        """
+        識別 VCP 的多次波動收縮。
+        策略：在過去 6 個月中，以區間高低點識別每段整理的幅度，
+        判斷幅度是否遞減。
+        """
+        prices = df["Close"].iloc[-126:]   # 約 6 個月
+        volumes = df["Volume"].iloc[-126:]
 
-## 🚀 快速部署
+        # 以 10 日滾動視窗切分「波段」
+        window = 10
+        drawdowns = []
+        vol_ratios = []
+        baseline_vol = float(volumes.mean())
 
-### Step 1：Fork 或 Clone 本倉庫
+        for start in range(0, len(prices) - window * 2, window):
+            seg = prices.iloc[start: start + window]
+            seg_vol = volumes.iloc[start: start + window]
+            hi = float(seg.max())
+            lo = float(seg.min())
+            if hi > 0:
+                drawdown = (hi - lo) / hi
+                drawdowns.append(drawdown)
+                vol_ratios.append(float(seg_vol.mean()) / baseline_vol if baseline_vol > 0 else 1.0)
 
-```bash
-git clone https://github.com/YOUR_USERNAME/vcp-scanner.git
-cd vcp-scanner
-```
+        if len(drawdowns) < 2:
+            return {"contractions": 0, "decreasing": False, "vol_decreasing": False, "last_drawdown": 0.0}
 
-### Step 2：設定 GitHub Secrets
+        # 判斷幅度是否整體遞減（用線性回歸斜率）
+        x = np.arange(len(drawdowns))
+        slope_dd  = float(np.polyfit(x, drawdowns, 1)[0])
+        slope_vol = float(np.polyfit(x, vol_ratios, 1)[0])
 
-前往 `Settings → Secrets and variables → Actions → New repository secret`
+        # 計算收縮次數（相鄰幅度遞減即計 +1）
+        contractions = sum(
+            1 for i in range(1, len(drawdowns)) if drawdowns[i] < drawdowns[i - 1]
+        )
 
-| Secret 名稱 | 說明 | 範例 |
-|-------------|------|------|
-| `EMAIL_SENDER` | 寄件 Gmail 帳號 | `your.scanner@gmail.com` |
-| `EMAIL_PASSWORD` | Gmail App Password（非帳號密碼）| `xxxx xxxx xxxx xxxx` |
-| `EMAIL_RECIPIENT` | 收件信箱 | `your@email.com` |
+        return {
+            "contractions":   contractions,
+            "decreasing":     slope_dd < 0,     # 幅度整體遞減
+            "vol_decreasing": slope_vol < 0,    # 量能整體遞減
+            "last_drawdown":  drawdowns[-1],    # 最後一段收縮幅度
+        }
 
-> ⚠️ **Gmail App Password 設定方式**：
-> Google 帳號 → 安全性 → 兩步驟驗證（需開啟）→ 應用程式密碼 → 產生
+    @staticmethod
+    def calc_pivot(df: pd.DataFrame) -> float:
+        """簡易樞軸價：最近整理高點（過去 10 日最高）"""
+        return float(df["High"].iloc[-10:].max())
 
-### Step 3：啟用 GitHub Actions
 
-確認 `.github/workflows/vcp_scan.yml` 存在，Actions 會自動在以下時間執行：
-- **平日（週一至週五）UTC 22:00**（台灣時間 隔天 06:00）
-- 或手動觸發（Actions → Run workflow）
+# ── 評分引擎 ──────────────────────────────────────────────────────────────────
 
-### Step 4：本地測試（選擇性）
+class ScoringEngine:
 
-```bash
-pip install -r requirements.txt
+    def __init__(self, spy_df: pd.DataFrame | None):
+        self.spy_df = spy_df
 
-export EMAIL_RECIPIENT="you@email.com"
-export EMAIL_SENDER="sender@gmail.com"
-export EMAIL_PASSWORD="your-app-password"
+    def score_vcp_quality(self, info: dict) -> float:
+        """VCP 收縮品質（滿分 30）"""
+        score = 0.0
+        n = info["contractions"]
+        # 理想收縮次數 2–4
+        if   n >= 3: score += 15
+        elif n == 2: score += 10
+        elif n == 1: score += 5
 
-python vcp_scanner.py
-```
+        if info["decreasing"]:     score += 10   # 幅度遞減
+        if info["vol_decreasing"]: score +=  5   # 量縮遞減
+        return min(score, 30)
 
----
+    def score_trend_template(self, passed: int, total: int = 9) -> float:
+        """MM 趨勢模板（滿分 25，線性比例）"""
+        return round(25 * passed / total, 1)
 
-## 📧 Email 報告範例
+    def score_stage(self, df: pd.DataFrame) -> float:
+        """
+        Stage 2 判斷（滿分 15）：
+        - 股價在 30/10/40 週均線之上且均線多頭排列
+        """
+        close = df["Close"]
+        ma10w  = close.rolling(50).mean().iloc[-1]   # ≈10 週
+        ma30w  = close.rolling(150).mean().iloc[-1]  # ≈30 週
+        ma40w  = close.rolling(200).mean().iloc[-1]  # ≈40 週
+        c = close.iloc[-1]
 
-收到的 Email 包含：
-- 每隻股票的 **評分（0-100）與等級（A+~D）**
-- 現價、**樞軸突破價**（進場參考）、**停損位**
-- Stage 階段、收縮次數、RS 評分
-- MM 趨勢模板 8 項通過狀況（✅/❌）
+        if c > ma10w and ma10w > ma30w and ma30w > ma40w:
+            return 15.0   # 典型 Stage 2
+        elif c > ma30w:
+            return 8.0    # 部分符合
+        return 0.0
 
----
+    def score_volume_pattern(self, df: pd.DataFrame) -> float:
+        """
+        量能模式（滿分 15）：
+        - 基部整體量縮（收縮期均量 < 長期均量）
+        - 最近一日量是否出現異常放量（可能突破前兆）
+        """
+        score = 0.0
+        avg_vol_long   = float(df["Volume"].rolling(50).mean().iloc[-1])
+        avg_vol_recent = float(df["Volume"].rolling(10).mean().iloc[-1])
 
-## ⚙️ 自訂設定
+        if avg_vol_recent < avg_vol_long:
+            score += 10   # 基部量縮
 
-### 調整篩選標準（在 workflow_dispatch 或環境變數設定）
+        last_vol = float(df["Volume"].iloc[-1])
+        if last_vol > avg_vol_long * 1.5:
+            score += 5    # 潛在放量突破訊號
 
-```yaml
-MIN_SCORE: "50"          # 總分門檻（建議 45~60）
-TREND_MIN_PASSED: "8"    # MM 趨勢模板最少通過幾項（0~9，建議 7~8）
-MIN_CONTRACTIONS: "1"    # 最少收縮次數（建議 1，若行情弱可調成 0）
-```
+        return min(score, 15)
 
-> 若你常常「完全沒有股票」，先把 `MIN_SCORE` 降到 45，或把 `TREND_MIN_PASSED` 由 8 降到 7，通常就能看到候選名單。
+    def score_rs(self, df: pd.DataFrame) -> float:
+        """
+        相對強度 vs S&P 500（滿分 10）：
+        比較過去 3 個月報酬率相對於 SPY
+        """
+        if self.spy_df is None or len(df) < 63:
+            return 5.0    # 無基準時給平均分
 
-### 修改掃描股票池
+        stock_ret = float(df["Close"].iloc[-1] / df["Close"].iloc[-63] - 1)
 
-在 `vcp_scanner.py` 的 `get_top1000_tickers()` 函數中調整。
+        # 對齊日期
+        spy = self.spy_df["Close"].reindex(df.index, method="ffill")
+        if len(spy) < 63:
+            return 5.0
+        spy_ret = float(spy.iloc[-1] / spy.iloc[-63] - 1)
 
----
+        if   stock_ret > spy_ret + 0.10: return 10.0
+        elif stock_ret > spy_ret + 0.05: return  8.0
+        elif stock_ret > spy_ret:        return  5.0
+        else:                            return  0.0
 
-## 📁 輸出檔案
+    def score_tightness(self, info: dict) -> float:
+        """最後整理緊縮度（滿分 5）"""
+        last_dd = info.get("last_drawdown", 1.0)
+        if   last_dd < 0.04: return 5.0
+        elif last_dd < 0.06: return 4.0
+        elif last_dd < 0.08: return 3.0
+        elif last_dd < 0.12: return 2.0
+        return 0.0
 
-| 檔案 | 說明 |
-|------|------|
-| `vcp_results.json` | 當日掃描結果（JSON 格式） |
-| `vcp_scan.log` | 執行日誌 |
-| `results/vcp_YYYY-MM-DD.json` | 歷史結果存檔 |
 
----
+class AnalystEngine:
+    """
+    華爾街分析師常用的技術面框架（簡化）：
+    - 趨勢：短中期均線多頭排列
+    - 動能：RSI 在強勢但不過熱區間
+    - 量價：接近/突破 pivot 時具量能支持
+    - 風報比：至少達到 1.8R
+    """
 
-## ⚠️ 免責聲明
+    @staticmethod
+    def calc_rsi(close: pd.Series, period: int = 14) -> float:
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(period).mean()
+        loss = (-delta.clip(upper=0)).rolling(period).mean()
+        # loss = 0 代表近期幾乎無下跌，RSI 應偏高而非回到中性
+        rs = gain / loss.replace(0, 1e-10)
+        rsi = 100 - (100 / (1 + rs))
+        if pd.isna(rsi.iloc[-1]):
+            return 50.0
+        return float(rsi.iloc[-1])
 
-本程式僅供學習研究用途，**不構成任何投資建議**。股市投資有賺有賠，請自行評估風險，任何交易決策請搭配個人判斷與完整研究。
+    @staticmethod
+    def build_plan(df: pd.DataFrame, pivot: float) -> dict:
+        close = df["Close"]
+        high = df["High"]
+        low = df["Low"]
+        volume = df["Volume"]
 
----
+        last_close = float(close.iloc[-1])
+        ma20 = float(close.rolling(20).mean().iloc[-1])
+        ma50 = float(close.rolling(50).mean().iloc[-1])
+        rsi = AnalystEngine.calc_rsi(close)
 
-## 📚 參考資料
+        avg_vol_20 = float(volume.rolling(20).mean().iloc[-1])
+        vol_ratio = float(volume.iloc[-1] / avg_vol_20) if avg_vol_20 > 0 else 1.0
+        support_20d = float(low.iloc[-20:].min())
+        resistance_60d = float(high.iloc[-60:].max())
 
-- Mark Minervini, *Trade Like a Stock Market Wizard* (2013)
-- Mark Minervini, *Think & Trade Like a Champion* (2017)
-- Stan Weinstein, *Secrets for Profiting in Bull and Bear Markets* (1988)
+        # 入場：突破 pivot 後再加 0.5% 緩衝，減少假突破
+        entry = round(max(last_close, pivot * 1.005), 2)
+        # 停損以「較近」者為主，避免風險過寬；同時確保停損低於入場價
+        raw_stop = max(support_20d * 0.995, entry * 0.97)
+        stop_loss = round(min(raw_stop, entry * 0.995), 2)
+        risk = max(entry - stop_loss, 0.01)
+
+        # 目標價優先以壓力區推估，若壓力太近才退回固定 R 倍數
+        raw_take_profit = resistance_60d * 1.02
+        if raw_take_profit <= entry:
+            raw_take_profit = entry + 1.5 * risk
+        take_profit = round(raw_take_profit, 2)
+        risk_reward = round((take_profit - entry) / risk, 2)
+
+        momentum_ok = 50 <= rsi <= 75
+        trend_ok = last_close > ma20 > ma50
+        volume_ok = vol_ratio >= 1.2 or last_close >= pivot
+        recommendation = "BUY" if (momentum_ok and trend_ok and volume_ok and risk_reward >= 1.8) else "WATCH"
+
+        return {
+            "recommendation": recommendation,
+            "entry": entry,
+            "take_profit": take_profit,
+            "stop_loss": stop_loss,
+            "rsi": round(rsi, 1),
+            "risk_reward": risk_reward,
+            "analyst_flags": {
+                "momentum_ok": momentum_ok,
+                "trend_ok": trend_ok,
+                "volume_ok": volume_ok,
+            },
+        }
+
+
+# ── 掃描主體 ──────────────────────────────────────────────────────────────────
+
+class VCPScanner:
+
+    def __init__(
+        self,
+        min_score: int = 50,
+        trend_min_passed: int = 8,
+        min_contractions: int = 1,
+        only_buy_recommendation: bool = False,
+    ):
+        self.min_score = min_score
+        self.trend_min_passed = max(5, min(trend_min_passed, 9))
+        self.min_contractions = max(0, min_contractions)
+        self.only_buy_recommendation = only_buy_recommendation
+        self.results: list[dict] = []
+        self.rejections: dict[str, int] = {
+            "data_unavailable": 0,
+            "trend_template": 0,
+            "insufficient_contractions": 0,
+            "score_below_min": 0,
+            "not_buy_signal": 0,
+        }
+        self.near_misses: list[dict] = []
+
+    def analyse_ticker(self, ticker: str, spy_df: pd.DataFrame | None) -> dict | None:
+        df = DataFetcher.download(ticker)
+        if df is None:
+            self.rejections["data_unavailable"] += 1
+            return None
+
+        # ── 趨勢模板前置篩選 ─────────────────────────────
+        passed_template, passed_count = TrendAnalyzer.check_trend_template(df)
+        if passed_count < self.trend_min_passed:
+            self.rejections["trend_template"] += 1
+            return None
+
+        # ── VCP 形態分析 ──────────────────────────────────
+        vcp_info = VCPAnalyzer.detect_contractions(df)
+        if vcp_info["contractions"] < self.min_contractions:
+            self.rejections["insufficient_contractions"] += 1
+            return None
+
+        pivot    = VCPAnalyzer.calc_pivot(df)
+
+        # ── 評分 ──────────────────────────────────────────
+        engine = ScoringEngine(spy_df)
+        scores = {
+            "vcp_quality":    engine.score_vcp_quality(vcp_info),
+            "trend_template": engine.score_trend_template(passed_count),
+            "stage":          engine.score_stage(df),
+            "volume_pattern": engine.score_volume_pattern(df),
+            "rs":             engine.score_rs(df),
+            "tightness":      engine.score_tightness(vcp_info),
+        }
+        total = round(sum(scores.values()), 1)
+        plan = AnalystEngine.build_plan(df, pivot)
+
+        avg_vol   = float(df["Volume"].rolling(20).mean().iloc[-1])
+        last_vol  = float(df["Volume"].iloc[-1])
+        last_close = float(df["Close"].iloc[-1])
+
+        return {
+            "ticker":         ticker,
+            "score":          total,
+            "grade":          score_to_grade(total),
+            "trend_template_passed": passed_template,
+            "price":          round(last_close, 2),
+            "pivot":          round(pivot, 2),
+            "stop_loss":      plan["stop_loss"],
+            "contractions":   vcp_info["contractions"],
+            "last_drawdown":  f"{round(vcp_info['last_drawdown']*100, 1)}%",
+            "vol_ratio":      round(last_vol / avg_vol, 2) if avg_vol > 0 else None,
+            "trend_passed":   f"{passed_count}/9",
+            "recommendation": plan["recommendation"],
+            "entry":          plan["entry"],
+            "take_profit":    plan["take_profit"],
+            "rsi":            plan["rsi"],
+            "risk_reward":    plan["risk_reward"],
+            "analyst_flags":  plan["analyst_flags"],
+            "score_breakdown": scores,
+            "scanned_at":     datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+
+    def run(self) -> list[dict]:
+        tickers = DataFetcher.get_sp500_tickers()
+        spy_df  = DataFetcher.download_benchmark()
+        if spy_df is None:
+            logger.warning("無法下載 SPY 基準，RS 評分將使用預設值")
+
+        logger.info(f"開始掃描 {len(tickers)} 隻股票（門檻：{self.min_score} 分）")
+        for i, ticker in enumerate(tickers):
+            try:
+                result = self.analyse_ticker(ticker, spy_df)
+                if result and result["score"] >= self.min_score:
+                    if self.only_buy_recommendation and result["recommendation"] != "BUY":
+                        self.rejections["not_buy_signal"] += 1
+                        self.near_misses.append(result)
+                        continue
+                    self.results.append(result)
+                    logger.info(f"  ✅ {ticker} | 分數：{result['score']} | 等級：{result['grade']}")
+                elif result:
+                    self.rejections["score_below_min"] += 1
+                    self.near_misses.append(result)
+            except Exception as e:
+                logger.debug(f"{ticker} 分析例外：{e}")
+
+            if (i + 1) % 50 == 0:
+                logger.info(f"進度：{i+1}/{len(tickers)}，目前命中：{len(self.results)} 隻")
+            time.sleep(0.1)
+
+        self.results.sort(
+            key=lambda x: (x["recommendation"] == "BUY", x["score"], x["risk_reward"]),
+            reverse=True,
+        )
+        self.near_misses.sort(key=lambda x: x["score"], reverse=True)
+
+        logger.info(
+            "掃描完成，共 %s 隻符合條件；淘汰統計：%s",
+            len(self.results),
+            self.rejections,
+        )
+        if not self.results and self.near_misses:
+            logger.info(
+                "目前無達標股票，最接近門檻前 5 名：%s",
+                [f"{x['ticker']}({x['score']})" for x in self.near_misses[:5]],
+            )
+        return self.results
+
+
+# ── Email 通知 ────────────────────────────────────────────────────────────────
+
+class EmailNotifier:
+
+    def __init__(self):
+        self.sender    = os.environ["EMAIL_SENDER"]
+        self.password  = os.environ["EMAIL_PASSWORD"]
+        self.recipient = os.environ["EMAIL_RECIPIENT"]
+
+    def _build_html(self, results: list[dict]) -> str:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        rows = ""
+        for r in results:
+            rows += f"""
+            <tr>
+              <td><strong>{r['ticker']}</strong></td>
+              <td style="color:{'#16a085' if r['recommendation']=='BUY' else '#7f8c8d'}"><strong>{r['recommendation']}</strong></td>
+              <td style="color:{'#27ae60' if r['grade']=='A+' else '#2980b9'}">{r['grade']}</td>
+              <td>{r['score']}</td>
+              <td>${r['price']}</td>
+              <td>${r['pivot']}</td>
+              <td>${r['entry']}</td>
+              <td>${r['take_profit']}</td>
+              <td>${r['stop_loss']}</td>
+              <td>{r['risk_reward']}R</td>
+              <td>{r['rsi']}</td>
+              <td>{r['contractions']}</td>
+              <td>{r['last_drawdown']}</td>
+              <td>{r['vol_ratio']}</td>
+              <td>{r['trend_passed']}</td>
+            </tr>"""
+
+        return f"""
+        <html><body style="font-family:Arial,sans-serif">
+        <h2>📈 VCP Scanner 每日報告 — {date_str}</h2>
+        <p>共篩選出 <strong>{len(results)}</strong> 隻符合條件股票</p>
+        <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%">
+          <thead style="background:#2c3e50;color:white">
+            <tr>
+              <th>股票</th><th>建議</th><th>等級</th><th>分數</th><th>現價</th>
+              <th>樞軸</th><th>入場位</th><th>止賺位</th><th>止損位</th>
+              <th>風報比</th><th>RSI</th><th>收縮次數</th>
+              <th>末段收縮</th><th>量比</th><th>趨勢模板</th>
+            </tr>
+          </thead>
+          <tbody>{rows}</tbody>
+        </table>
+        <hr>
+        <p style="color:gray;font-size:12px">
+          ⚠️ 本報告僅供學習研究，不構成投資建議。
+        </p>
+        </body></html>"""
+
+    def send(self, results: list[dict]) -> None:
+        if not results:
+            logger.info("無符合條件股票，不發送 Email")
+            return
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"📈 VCP Scanner — {datetime.now().strftime('%Y-%m-%d')} ({len(results)} 隻)"
+        msg["From"]    = self.sender
+        msg["To"]      = self.recipient
+        msg.attach(MIMEText(self._build_html(results), "html", "utf-8"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(self.sender, self.password)
+            server.sendmail(self.sender, self.recipient, msg.as_string())
+        logger.info(f"Email 已寄出至 {self.recipient}")
+
+
+# ── 主程式 ────────────────────────────────────────────────────────────────────
+
+def main():
+    min_score = int(os.getenv("MIN_SCORE", "50"))
+    trend_min_passed = int(os.getenv("TREND_MIN_PASSED", "8"))
+    min_contractions = int(os.getenv("MIN_CONTRACTIONS", "1"))
+    only_buy_recommendation = os.getenv("ONLY_BUY_RECOMMENDATION", "false").lower() == "true"
+
+    logger.info(
+        "目前設定：MIN_SCORE=%s, TREND_MIN_PASSED=%s/9, MIN_CONTRACTIONS=%s, ONLY_BUY_RECOMMENDATION=%s",
+        min_score,
+        trend_min_passed,
+        min_contractions,
+        only_buy_recommendation,
+    )
+
+    scanner = VCPScanner(
+        min_score=min_score,
+        trend_min_passed=trend_min_passed,
+        min_contractions=min_contractions,
+        only_buy_recommendation=only_buy_recommendation,
+    )
+    results = scanner.run()
+
+    # 儲存 JSON
+    out_path = f"results/vcp_{datetime.now().strftime('%Y-%m-%d')}.json"
+    os.makedirs("results", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    with open("vcp_results.json", "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    logger.info(f"結果已儲存：{out_path}")
+
+    # 發送 Email（環境變數存在時才發送）
+    if all(os.getenv(k) for k in ("EMAIL_SENDER", "EMAIL_PASSWORD", "EMAIL_RECIPIENT")):
+        EmailNotifier().send(results)
+    else:
+        logger.info("未設定 Email 環境變數，略過寄信")
+
+
+if __name__ == "__main__":
+    main()
