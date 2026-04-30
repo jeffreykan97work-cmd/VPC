@@ -9,6 +9,7 @@ import json
 import logging
 import smtplib
 import time
+from typing import Dict, List, Optional, Tuple
 from typing import Optional
 import requests
 import pandas as pd
@@ -415,7 +416,7 @@ class DataFetcher:
     HEADERS = {"User-Agent": "Mozilla/5.0"}
 
     @staticmethod
-    def get_sp500_tickers() -> list[str]:
+    def get_sp500_tickers() -> List[str]:
         """取得 S&P 500 成分股清單（Wikipedia）"""
         try:
             url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -458,7 +459,7 @@ class DataFetcher:
 class TrendAnalyzer:
 
     @staticmethod
-    def check_trend_template(df: pd.DataFrame) -> tuple[bool, int]:
+    def check_trend_template(df: pd.DataFrame) -> Tuple[bool, int]:
         """
         MM 趨勢模板 — 8 項條件，全部通過才進入評分。
         回傳 (是否通過, 通過項目數)，供評分參考。
@@ -726,6 +727,8 @@ class VCPScanner:
         self.trend_min_passed = max(5, min(trend_min_passed, 9))
         self.min_contractions = max(0, min_contractions)
         self.only_buy_recommendation = only_buy_recommendation
+        self.results: List[Dict] = []
+        self.rejections: Dict[str, int] = {
         self.results: list[dict] = []
         self.rejections: dict[str, int] = {
             "data_unavailable": 0,
@@ -734,6 +737,7 @@ class VCPScanner:
             "score_below_min": 0,
             "not_buy_signal": 0,
         }
+        self.near_misses: List[Dict] = []
         self.near_misses: list[dict] = []
 
     def analyse_ticker(self, ticker: str, spy_df: Optional[pd.DataFrame]) -> Optional[dict]:
@@ -795,7 +799,7 @@ class VCPScanner:
             "scanned_at":     datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
 
-    def run(self) -> list[dict]:
+    def run(self) -> List[Dict]:
         tickers = DataFetcher.get_sp500_tickers()
         spy_df  = DataFetcher.download_benchmark()
         if spy_df is None:
@@ -850,7 +854,7 @@ class EmailNotifier:
         self.password  = os.environ["EMAIL_PASSWORD"]
         self.recipient = os.environ["EMAIL_RECIPIENT"]
 
-    def _build_html(self, results: list[dict]) -> str:
+    def _build_html(self, results: List[Dict]) -> str:
         date_str = datetime.now().strftime("%Y-%m-%d")
         rows = ""
         for r in results:
@@ -894,7 +898,7 @@ class EmailNotifier:
         </p>
         </body></html>"""
 
-    def send(self, results: list[dict]) -> None:
+    def send(self, results: List[Dict]) -> None:
         if not results:
             logger.info("無符合條件股票，不發送 Email")
             return
