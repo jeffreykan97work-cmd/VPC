@@ -1,3 +1,32 @@
+#!/usr/bin/env python3
+"""
+VCP Scanner — Mark Minervini 自動選股系統
+基於《Trade Like a Stock Market Wizard》的 VCP 方法論
+"""
+
+import os
+import json
+import logging
+import smtplib
+import time
+from typing import Optional
+import requests
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from io import StringIO
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# ── 日誌設定 ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("vcp_scan.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
  (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/vcp_scanner.py b/vcp_scanner.py
 index aa80305b8845eec3c672fe019708436fa2da7115..e5100c627f5df91bf057917c70533cf61c425dce 100644
@@ -404,7 +433,7 @@ class DataFetcher:
             ]
 
     @staticmethod
-    def download(ticker: str, period: str = "1y") -> pd.DataFrame | None:
+    def download(ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
         """下載股價資料，失敗時記錄具體錯誤"""
         try:
             df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
@@ -419,7 +448,7 @@ class DataFetcher:
             return None
 
     @staticmethod
-    def download_benchmark(period: str = "1y") -> pd.DataFrame | None:
+    def download_benchmark(period: str = "1y") -> Optional[pd.DataFrame]:
         """下載 SPY 作為大盤基準"""
         return DataFetcher.download("SPY", period)
 
@@ -523,7 +552,7 @@ class VCPAnalyzer:
 
 class ScoringEngine:
 
-    def __init__(self, spy_df: pd.DataFrame | None):
+    def __init__(self, spy_df: Optional[pd.DataFrame]):
         self.spy_df = spy_df
 
     def score_vcp_quality(self, info: dict) -> float:
@@ -707,7 +736,7 @@ class VCPScanner:
         }
         self.near_misses: list[dict] = []
 
-    def analyse_ticker(self, ticker: str, spy_df: pd.DataFrame | None) -> dict | None:
+    def analyse_ticker(self, ticker: str, spy_df: Optional[pd.DataFrame]) -> Optional[dict]:
         df = DataFetcher.download(ticker)
         if df is None:
             self.rejections["data_unavailable"] += 1
