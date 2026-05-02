@@ -16,7 +16,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from io import StringIO
-from datetime import datetime, timedelta
+from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
