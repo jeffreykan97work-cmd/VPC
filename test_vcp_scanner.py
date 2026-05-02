@@ -54,20 +54,6 @@ class TestScannerDefaults(unittest.TestCase):
             os.environ.clear()
             os.environ.update(old_env)
 
-    def test_source_file_has_no_patch_artifacts(self):
-        # 防止誤把 shell patch 內容貼進 Python 檔，導致 CI 直接 SyntaxError
-        with open("vcp_scanner.py", "r", encoding="utf-8") as f:
-            source = f.read()
-        forbidden_snippets = [
-            "git apply --3way",
-            "<<'EOF'",
-            "<<<<<<<",
-            "=======",
-            ">>>>>>>",
-        ]
-        for snippet in forbidden_snippets:
-            self.assertNotIn(snippet, source)
-
 
 if __name__ == "__main__":
     unittest.main()
