@@ -40,10 +40,11 @@ SCORE_WEIGHTS = {
     "rs":             10,   # 相對強度 vs S&P 500
     "tightness":       5,   # 最後整理緊縮度
 }
-GRADE_MAP = [(85, "A+"), (75, "A"), (65, "B"), (50, "C")]
+GRADE_MAP = [(75, "A"), (60, "B"), (45, "C"), (0, "D")]
 
 
 def score_to_grade(score: float) -> str:
+    """Convert the composite score into a simple A/B/C/D ranking."""
     for threshold, grade in GRADE_MAP:
         if score >= threshold:
             return grade
@@ -117,8 +118,9 @@ class TrendAnalyzer:
         ma200_20d_ago = float(close.rolling(200).mean().iloc[-21])
         ma200_rising  = ma200 > ma200_20d_ago
 
-        low_52w  = float(low.rolling(252).min().iloc[-1])
-        high_52w = float(high.rolling(252).max().iloc[-1])
+        # yfinance 的 1y 資料有時少於完整 252 個交易日；用 min_periods 避免 NaN 令條件必然失敗。
+        low_52w  = float(low.rolling(252, min_periods=200).min().iloc[-1])
+        high_52w = float(high.rolling(252, min_periods=200).max().iloc[-1])
 
         conditions = [
             c > ma150,                    # 1. 股價 > 150MA
@@ -286,7 +288,7 @@ class AnalystEngine:
     - 趨勢：短中期均線多頭排列
     - 動能：RSI 在強勢但不過熱區間
     - 量價：接近/突破 pivot 時具量能支持
-    - 風報比：至少達到 1.8R
+    - 風報比：至少達到 1.5R
     """
 
     @staticmethod
@@ -318,27 +320,54 @@ class AnalystEngine:
         support_20d = float(low.iloc[-20:].min())
         resistance_60d = float(high.iloc[-60:].max())
 
-        # 入場：突破 pivot 後再加 0.5% 緩衝，減少假突破
-        entry = round(max(last_close, pivot * 1.005), 2)
+        # 入場：放寬為接近 pivot 亦可分批；若未突破，仍以 pivot 上方 0.25% 作確認位
+        entry = round(max(last_close, pivot * 1.0025), 2)
         # 停損以「較近」者為主，避免風險過寬；同時確保停損低於入場價
-        raw_stop = max(support_20d * 0.995, entry * 0.97)
+        raw_stop = max(support_20d * 0.995, entry * 0.965)
         stop_loss = round(min(raw_stop, entry * 0.995), 2)
         risk = max(entry - stop_loss, 0.01)
 
         # 目標價優先以壓力區推估，若壓力太近才退回固定 R 倍數
         raw_take_profit = resistance_60d * 1.02
         if raw_take_profit <= entry:
-            raw_take_profit = entry + 1.5 * risk
+            raw_take_profit = entry + 1.8 * risk
         take_profit = round(raw_take_profit, 2)
         risk_reward = round((take_profit - entry) / risk, 2)
 
-        momentum_ok = 50 <= rsi <= 75
-        trend_ok = last_close > ma20 > ma50
-        volume_ok = vol_ratio >= 1.2 or last_close >= pivot
-        recommendation = "BUY" if (momentum_ok and trend_ok and volume_ok and risk_reward >= 1.8) else "WATCH"
+        # 放寬推薦框架：華爾街常用「趨勢 + 動能 + 量價 + 風報比」綜合評級，
+        # 不要求每一項完美才輸出 BUY，避免強勢整理市況下完全沒有候選股。
+        momentum_ok = 45 <= rsi <= 82
+        trend_ok = last_close > ma50 and ma20 >= ma50 * 0.98
+        volume_ok = vol_ratio >= 0.9 or last_close >= pivot * 0.98
+        risk_ok = risk_reward >= 1.5
+        setup_points = sum([momentum_ok, trend_ok, volume_ok, risk_ok])
+
+        if setup_points >= 4:
+            recommendation = "BUY"
+            analyst_rating = "Strong Buy"
+            confidence = "High"
+        elif setup_points == 3:
+            recommendation = "BUY"
+            analyst_rating = "Buy"
+            confidence = "Medium"
+        elif setup_points == 2:
+            recommendation = "WATCH"
+            analyst_rating = "Outperform Watchlist"
+            confidence = "Medium-Low"
+        else:
+            recommendation = "WATCH"
+            analyst_rating = "Neutral"
+            confidence = "Low"
+
+        upside_pct = round((take_profit / last_close - 1) * 100, 1) if last_close > 0 else 0.0
+        downside_pct = round((stop_loss / last_close - 1) * 100, 1) if last_close > 0 else 0.0
 
         return {
             "recommendation": recommendation,
+            "analyst_rating": analyst_rating,
+            "confidence": confidence,
+            "upside_pct": upside_pct,
+            "downside_pct": downside_pct,
             "entry": entry,
             "take_profit": take_profit,
             "stop_loss": stop_loss,
@@ -348,6 +377,8 @@ class AnalystEngine:
                 "momentum_ok": momentum_ok,
                 "trend_ok": trend_ok,
                 "volume_ok": volume_ok,
+                "risk_ok": risk_ok,
+                "setup_points": setup_points,
             },
         }
 
@@ -358,15 +389,17 @@ class VCPScanner:
 
     def __init__(
         self,
-        min_score: int = 50,
-        trend_min_passed: int = 8,
-        min_contractions: int = 1,
+        min_score: int = 40,
+        trend_min_passed: int = 6,
+        min_contractions: int = 0,
         only_buy_recommendation: bool = False,
+        min_results: int = 10,
     ):
         self.min_score = min_score
-        self.trend_min_passed = max(5, min(trend_min_passed, 9))
+        self.trend_min_passed = max(4, min(trend_min_passed, 9))
         self.min_contractions = max(0, min_contractions)
         self.only_buy_recommendation = only_buy_recommendation
+        self.min_results = max(0, min_results)
         self.results: list[dict] = []
         self.rejections: dict[str, int] = {
             "data_unavailable": 0,
@@ -427,6 +460,10 @@ class VCPScanner:
             "vol_ratio":      round(last_vol / avg_vol, 2) if avg_vol > 0 else None,
             "trend_passed":   f"{passed_count}/9",
             "recommendation": plan["recommendation"],
+            "analyst_rating": plan["analyst_rating"],
+            "confidence":     plan["confidence"],
+            "upside_pct":     plan["upside_pct"],
+            "downside_pct":   plan["downside_pct"],
             "entry":          plan["entry"],
             "take_profit":    plan["take_profit"],
             "rsi":            plan["rsi"],
@@ -463,11 +500,22 @@ class VCPScanner:
                 logger.info(f"進度：{i+1}/{len(tickers)}，目前命中：{len(self.results)} 隻")
             time.sleep(0.1)
 
-        self.results.sort(
-            key=lambda x: (x["recommendation"] == "BUY", x["score"], x["risk_reward"]),
-            reverse=True,
-        )
         self.near_misses.sort(key=lambda x: x["score"], reverse=True)
+        if len(self.results) < self.min_results:
+            needed = self.min_results - len(self.results)
+            supplements = [
+                dict(item, fallback_pick=True)
+                for item in self.near_misses
+                if not self.only_buy_recommendation or item["recommendation"] == "BUY"
+            ][:needed]
+            if supplements:
+                self.results.extend(supplements)
+                logger.info("命中數低於 %s，補入最接近門檻候選 %s 隻作觀察名單", self.min_results, len(supplements))
+
+        grade_order = {"A": 0, "B": 1, "C": 2, "D": 3}
+        self.results.sort(
+            key=lambda x: (grade_order.get(x["grade"], 9), not (x["recommendation"] == "BUY"), -x["score"], -x["risk_reward"])
+        )
 
         logger.info(
             "掃描完成，共 %s 隻符合條件；淘汰統計：%s",
@@ -499,13 +547,16 @@ class EmailNotifier:
             <tr>
               <td><strong>{r['ticker']}</strong></td>
               <td style="color:{'#16a085' if r['recommendation']=='BUY' else '#7f8c8d'}"><strong>{r['recommendation']}</strong></td>
-              <td style="color:{'#27ae60' if r['grade']=='A+' else '#2980b9'}">{r['grade']}</td>
+              <td>{r['analyst_rating']}</td>
+              <td>{r['confidence']}</td>
+              <td style="color:{'#27ae60' if r['grade']=='A' else '#2980b9'}">{r['grade']}</td>
               <td>{r['score']}</td>
               <td>${r['price']}</td>
               <td>${r['pivot']}</td>
               <td>${r['entry']}</td>
               <td>${r['take_profit']}</td>
               <td>${r['stop_loss']}</td>
+              <td>{r['upside_pct']}% / {r['downside_pct']}%</td>
               <td>{r['risk_reward']}R</td>
               <td>{r['rsi']}</td>
               <td>{r['contractions']}</td>
@@ -521,9 +572,9 @@ class EmailNotifier:
         <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%">
           <thead style="background:#2c3e50;color:white">
             <tr>
-              <th>股票</th><th>建議</th><th>等級</th><th>分數</th><th>現價</th>
-              <th>樞軸</th><th>入場位</th><th>止賺位</th><th>止損位</th>
-              <th>風報比</th><th>RSI</th><th>收縮次數</th>
+              <th>股票</th><th>建議</th><th>分析師評級</th><th>信心</th><th>等級</th><th>分數</th><th>現價</th>
+              <th>樞軸</th><th>入場位</th><th>目標價</th><th>止損位</th>
+              <th>上行/下行</th><th>風報比</th><th>RSI</th><th>收縮次數</th>
               <th>末段收縮</th><th>量比</th><th>趨勢模板</th>
             </tr>
           </thead>
@@ -572,17 +623,19 @@ def main():
         logger.warning("環境變數 %s=%r 不是布林值，改用預設值 %s", name, raw, default)
         return default
 
-    min_score = get_int_env("MIN_SCORE", 50)
-    trend_min_passed = get_int_env("TREND_MIN_PASSED", 8)
-    min_contractions = get_int_env("MIN_CONTRACTIONS", 1)
+    min_score = get_int_env("MIN_SCORE", 40)
+    trend_min_passed = get_int_env("TREND_MIN_PASSED", 6)
+    min_contractions = get_int_env("MIN_CONTRACTIONS", 0)
     only_buy_recommendation = get_bool_env("ONLY_BUY_RECOMMENDATION", False)
+    min_results = get_int_env("MIN_RESULTS", 10)
 
     logger.info(
-        "目前設定：MIN_SCORE=%s, TREND_MIN_PASSED=%s/9, MIN_CONTRACTIONS=%s, ONLY_BUY_RECOMMENDATION=%s",
+        "目前設定：MIN_SCORE=%s, TREND_MIN_PASSED=%s/9, MIN_CONTRACTIONS=%s, ONLY_BUY_RECOMMENDATION=%s, MIN_RESULTS=%s",
         min_score,
         trend_min_passed,
         min_contractions,
         only_buy_recommendation,
+        min_results,
     )
 
     scanner = VCPScanner(
@@ -590,6 +643,7 @@ def main():
         trend_min_passed=trend_min_passed,
         min_contractions=min_contractions,
         only_buy_recommendation=only_buy_recommendation,
+        min_results=min_results,
     )
     results = scanner.run()
 

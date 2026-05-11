@@ -4,7 +4,7 @@ import pandas as pd
 import os
 from unittest.mock import patch
 
-from vcp_scanner import AnalystEngine, VCPScanner, main
+from vcp_scanner import AnalystEngine, VCPScanner, main, score_to_grade
 
 
 def make_sample_df(rows: int = 260, seed: int = 42) -> pd.DataFrame:
@@ -29,17 +29,29 @@ class TestAnalystEngine(unittest.TestCase):
         plan = AnalystEngine.build_plan(df, pivot)
 
         self.assertIn(plan["recommendation"], {"BUY", "WATCH"})
+        self.assertIn(plan["analyst_rating"], {"Strong Buy", "Buy", "Outperform Watchlist", "Neutral"})
+        self.assertIn(plan["confidence"], {"High", "Medium", "Medium-Low", "Low"})
         self.assertGreater(plan["entry"], plan["stop_loss"])
         self.assertGreater(plan["take_profit"], plan["entry"])
         self.assertGreater(plan["risk_reward"], 0)
-        self.assertTrue({"momentum_ok", "trend_ok", "volume_ok"} <= set(plan["analyst_flags"].keys()))
+        self.assertTrue({"momentum_ok", "trend_ok", "volume_ok", "risk_ok", "setup_points"} <= set(plan["analyst_flags"].keys()))
 
 
 class TestScannerDefaults(unittest.TestCase):
     def test_default_config(self):
         scanner = VCPScanner()
+        self.assertEqual(scanner.min_score, 40)
+        self.assertEqual(scanner.trend_min_passed, 6)
+        self.assertEqual(scanner.min_contractions, 0)
+        self.assertEqual(scanner.min_results, 10)
         self.assertFalse(scanner.only_buy_recommendation)
         self.assertIn("not_buy_signal", scanner.rejections)
+
+    def test_score_to_grade_uses_abcd_buckets(self):
+        self.assertEqual(score_to_grade(80), "A")
+        self.assertEqual(score_to_grade(60), "B")
+        self.assertEqual(score_to_grade(45), "C")
+        self.assertEqual(score_to_grade(20), "D")
 
     @patch("vcp_scanner.VCPScanner.run", return_value=[])
     def test_main_tolerates_invalid_env_values(self, _mock_run):
